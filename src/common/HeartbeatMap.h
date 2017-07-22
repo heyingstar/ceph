@@ -22,7 +22,7 @@
 #include <time.h>
 
 #include "include/atomic.h"
-
+#include "Mutex.h"
 #include "RWLock.h"
 
 class CephContext;
@@ -45,10 +45,29 @@ struct heartbeat_handle_d {
   atomic_t timeout, suicide_timeout;
   time_t grace, suicide_grace;
   std::list<heartbeat_handle_d*>::iterator list_item;
+  pthread_t tid; // thread id
+
+  Mutex lock;
+  enum State {
+    STATE_NORMAL = 0,
+    STATE_TIMEDOUT,
+    STATE_SUICIDE_TIMEDOUT
+  } state;
 
   explicit heartbeat_handle_d(const std::string& n)
-    : name(n), grace(0), suicide_grace(0)
+    : name(n), grace(0), suicide_grace(0), tid(pthread_self())
+    , lock("heartbeat_handle_d:lock"), state(STATE_NORMAL)
   { }
+
+  bool set_state(State _state) {
+    Mutex::Locker l(lock);
+    if (state == _state)
+      return false;
+    state = _state;
+    return true;
+  }
+
+  bool check(CephContext *cct, const char *who, time_t now);
 };
 
 class HeartbeatMap {
@@ -84,8 +103,6 @@ class HeartbeatMap {
   std::list<heartbeat_handle_d*> m_workers;
   atomic_t m_unhealthy_workers;
   atomic_t m_total_workers;
-
-  bool _check(const heartbeat_handle_d *h, const char *who, time_t now);
 };
 
 }

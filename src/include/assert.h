@@ -148,3 +148,12 @@ using namespace ceph;
   ((expr)								\
    ? __CEPH_ASSERT_VOID_CAST (0)					\
    : __ceph_assertf_fail (__STRING(expr), __FILE__, __LINE__, __CEPH_ASSERT_FUNCTION, __VA_ARGS__))
+
+// for osd single process
+#define local_assert(expr) \
+  if (!cct->inject_failure() && \
+      !(expr) && \
+      !cct->report_assertion_failure(__STRING(expr), __FILE__, __LINE__, __CEPH_ASSERT_FUNCTION)) \
+    __ceph_assert_fail (__STRING(expr), __FILE__, __LINE__, __CEPH_ASSERT_FUNCTION)
+
+#define local_abort() local_assert(0)

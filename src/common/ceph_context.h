@@ -26,6 +26,7 @@
 #include "common/cmdparse.h"
 #include "include/Spinlock.h"
 #include <boost/noncopyable.hpp>
+#include <pthread.h>
 
 class AdminSocket;
 class CephContextServiceThread;
@@ -37,15 +38,56 @@ class CephContextHook;
 class CephContextObs;
 class CryptoHandler;
 
+class AsyncRdmaConns
+{
+public:
+  AsyncRdmaConns(CephContext *cct) : m_cct(cct), c_conns(0), s_conns(0) {}
+
+  virtual ~AsyncRdmaConns() {}
+
+  void dump_formatted(ceph::Formatter *f)
+  {
+    f->open_object_section("AsyncRdmaConnection");
+    f->dump_unsigned("server connections count:", s_conns.read());
+    f->dump_unsigned("client connections count:", c_conns.read());
+    f->close_section();
+  }
+
+  void dec_conns(bool is_server);
+  void inc_conns(bool is_server);
+
+private:
+  CephContext *m_cct;
+  atomic64_t c_conns;
+  atomic64_t s_conns;
+};
+
 namespace ceph {
   class PluginRegistry;
   class HeartbeatMap;
   namespace log {
     class Log;
+    class FLog;
   }
 }
 
 using ceph::bufferlist;
+
+// for osd single process
+class FailureHandler {
+protected:
+  atomic_t failed_at;
+  atomic_t failed;
+  virtual void handle_failure(int err, const char *desc) = 0;
+  virtual ~FailureHandler() {}
+public:
+  bool is_failed() { return failed.read(); }
+  bool inject_failure();
+  void report_failure(int err, const char *desc) {
+    if (failed.compare_and_swap(0, 1))
+      handle_failure(err, desc);
+  }
+};
 
 /* A CephContext represents the context held by a single library user.
  * There can be multiple CephContexts in the same process.
@@ -71,6 +113,22 @@ public:
 
   md_config_t *_conf;
   ceph::log::Log *_log;
+  ceph::log::FLog *_flog;
+  
+  /* add for dump begin */
+  bool _stop;
+  pthread_mutex_t g_lock_dump;
+  pthread_mutex_t g_lock_dump_finish;
+  pthread_cond_t g_dump_cond;
+  pthread_cond_t g_dump_finish_cond;
+  void send_fatal_cond(){
+    pthread_cond_broadcast(&g_dump_cond);
+    pthread_mutex_lock(&g_lock_dump_finish);
+    _stop = true;
+    pthread_cond_wait(&g_dump_finish_cond, &g_lock_dump_finish);
+    pthread_mutex_unlock(&g_lock_dump_finish);
+  };
+  /* dump end */
 
   /* init ceph::crypto */
   void init_crypto();
@@ -89,6 +147,9 @@ public:
 
   /* Get the PerfCountersCollection of this CephContext */
   PerfCountersCollection *get_perfcounters_collection();
+
+  /* Get the AsyncRdmaConns of this CephContext */
+  AsyncRdmaConns *get_AsyncRdmaConns();
 
   ceph::HeartbeatMap *get_heartbeat_map() {
     return _heartbeat_map;
@@ -140,6 +201,21 @@ public:
     }
     ceph_spin_unlock(&_associated_objs_lock);
   }
+
+  template<typename T>
+  void lookup_or_create_singleton_object(T*& p, const std::string &name, std::string mname) {
+    ceph_spin_lock(&_associated_objs_lock);
+    if (!_associated_objs.count(name)) {
+      p = new T(this, mname);
+      _associated_objs[name] = new TypedSingletonWrapper<T>(p);
+    } else {
+      TypedSingletonWrapper<T> *wrapper =
+        dynamic_cast<TypedSingletonWrapper<T> *>(_associated_objs[name]);
+      assert(wrapper != NULL);
+      p = wrapper->singleton;
+    }
+    ceph_spin_unlock(&_associated_objs_lock);
+  }
   /**
    * get a crypto handler
    */
@@ -174,6 +250,33 @@ public:
   }
   std::string get_set_gid_string() const {
     return _set_gid_string;
+  }
+
+  class ForkWatcher {
+   public:
+    virtual ~ForkWatcher() {}
+    virtual void handle_pre_fork() = 0;
+    virtual void handle_post_fork() = 0;
+  };
+
+  void register_fork_watcher(ForkWatcher *w) {
+    ceph_spin_lock(&_fork_watchers_lock);
+    _fork_watchers.push_back(w);
+    ceph_spin_unlock(&_fork_watchers_lock);
+  }
+
+  void notify_pre_fork() {
+    ceph_spin_lock(&_fork_watchers_lock);
+    for (auto &&t : _fork_watchers)
+      t->handle_pre_fork();
+    ceph_spin_unlock(&_fork_watchers_lock);
+  }
+
+  void notify_post_fork() {
+    ceph_spin_lock(&_fork_watchers_lock);
+    for (auto &&t : _fork_watchers)
+      t->handle_post_fork();
+    ceph_spin_unlock(&_fork_watchers_lock);
   }
 
 private:
@@ -215,6 +318,7 @@ private:
   CephContextServiceThread *_service_thread;
 
   md_config_obs_t *_log_obs;
+  md_config_obs_t *_flog_obs;
 
   /* The admin socket associated with this context */
   AdminSocket *_admin_socket;
@@ -225,6 +329,8 @@ private:
   /* The collection of profiling loggers associated with this context */
   PerfCountersCollection *_perf_counters_collection;
 
+  AsyncRdmaConns *_AsyncRdmaConns;
+
   md_config_obs_t *_perf_counters_conf_obs;
 
   CephContextHook *_admin_hook;
@@ -233,6 +339,9 @@ private:
 
   ceph_spinlock_t _associated_objs_lock;
   std::map<std::string, SingletonWrapper*> _associated_objs;
+
+  ceph_spinlock_t _fork_watchers_lock;
+  std::vector<ForkWatcher*> _fork_watchers;
 
   // crypto
   CryptoHandler *_crypto_none;
@@ -257,6 +366,37 @@ private:
   ceph_spinlock_t _cct_perf_lock;
 
   friend class CephContextObs;
+
+  // osd single process begin
+  FailureHandler *_failure_handler;
+
+public:
+  void set_failure_handler(FailureHandler *_handler) {
+    _failure_handler = _handler;
+  }
+
+  bool is_failed() const {
+    return _failure_handler && _failure_handler->is_failed();
+  }
+
+  bool inject_failure() const {
+    if (_failure_handler)
+      return _failure_handler->inject_failure();
+    else
+      return false;
+  }
+
+  bool report_failure(int errnum, const char *desc) const {
+    if (_failure_handler) {
+      _failure_handler->report_failure(errnum, desc);
+      return true;
+    }
+    return false;
+  }
+
+  bool report_assertion_failure(const char *assertion,
+    const char *file, int line, const char *function) const;
+  // osd single process end
 };
 
 #endif

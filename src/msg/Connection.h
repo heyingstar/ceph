@@ -134,7 +134,7 @@ public:
    *
    * It does not generate any notifications to the Dispatcher.
    */
-  virtual void mark_down() = 0;
+  virtual void mark_down_impl() = 0;
 
   /**
    * Mark a Connection as "disposable", setting it to lossy
@@ -151,34 +151,34 @@ public:
   virtual void mark_disposable() = 0;
 
 
-  int get_peer_type() const { return peer_type; }
+  virtual int get_peer_type() const { return peer_type; }
   void set_peer_type(int t) { peer_type = t; }
 
-  bool peer_is_mon() const { return peer_type == CEPH_ENTITY_TYPE_MON; }
-  bool peer_is_mds() const { return peer_type == CEPH_ENTITY_TYPE_MDS; }
-  bool peer_is_osd() const { return peer_type == CEPH_ENTITY_TYPE_OSD; }
-  bool peer_is_client() const { return peer_type == CEPH_ENTITY_TYPE_CLIENT; }
+  virtual bool peer_is_mon() const { return peer_type == CEPH_ENTITY_TYPE_MON; }
+  virtual bool peer_is_mds() const { return peer_type == CEPH_ENTITY_TYPE_MDS; }
+  virtual bool peer_is_osd() const { return peer_type == CEPH_ENTITY_TYPE_OSD; }
+  virtual bool peer_is_client() const { return peer_type == CEPH_ENTITY_TYPE_CLIENT; }
 
-  const entity_addr_t& get_peer_addr() const { return peer_addr; }
+  virtual const entity_addr_t& get_peer_addr() const { return peer_addr; }
   void set_peer_addr(const entity_addr_t& a) { peer_addr = a; }
 
-  uint64_t get_features() const { return features; }
-  bool has_feature(uint64_t f) const { return features & f; }
+  virtual uint64_t get_features() const { return features; }
+  virtual bool has_feature(uint64_t f) const { return features & f; }
   void set_features(uint64_t f) { features = f; }
   void set_feature(uint64_t f) { features |= f; }
 
-  void post_rx_buffer(ceph_tid_t tid, bufferlist& bl) {
+  virtual void post_rx_buffer(ceph_tid_t tid, bufferlist& bl) {
     Mutex::Locker l(lock);
     ++rx_buffers_version;
     rx_buffers[tid] = pair<bufferlist,int>(bl, rx_buffers_version);
   }
 
-  void revoke_rx_buffer(ceph_tid_t tid) {
+  virtual void revoke_rx_buffer(ceph_tid_t tid) {
     Mutex::Locker l(lock);
     rx_buffers.erase(tid);
   }
 
-  utime_t get_last_keepalive() const {
+  virtual utime_t get_last_keepalive() const {
     Mutex::Locker l(lock);
     return last_keepalive;
   }
@@ -186,7 +186,7 @@ public:
     Mutex::Locker l(lock);
     last_keepalive = t;
   }
-  utime_t get_last_keepalive_ack() const {
+  virtual utime_t get_last_keepalive_ack() const {
     Mutex::Locker l(lock);
     return last_keepalive_ack;
   }
@@ -195,9 +195,22 @@ public:
     last_keepalive_ack = t;
   }
 
+  virtual int get_osd_num() {return -1;};
+
 };
 
 typedef boost::intrusive_ptr<Connection> ConnectionRef;
 
+/*
+ * add this define only for get the caller information
+ */
+#define conn_mark_down(conn)	\
+    do {						\
+      assert(conn);	\
+      if(conn->get_messenger() != NULL)	\
+        ldout(conn->get_messenger()->cct, 0) << "conn_mark_down called, Caller:" << __func__	\
+          << " conn:" << conn << dendl;	\
+      conn->mark_down_impl();		\
+    } while (0)
 
 #endif /* CEPH_CONNECTION_H */

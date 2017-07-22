@@ -22,9 +22,11 @@
 using namespace std;
 
 #include "osd/OSD.h"
+#include "osd/OSDManager.h"
 #include "os/ObjectStore.h"
 #include "mon/MonClient.h"
 #include "include/ceph_features.h"
+#include "osd/OSDPseudo.h"
 
 #include "common/config.h"
 
@@ -60,7 +62,15 @@ TracepointProvider::Traits os_tracepoint_traits("libos_tp.so",
 
 } // anonymous namespace
 
+void handle_admin_signal(int signum)
+{
+  if (g_osd_manager)
+    g_osd_manager->handle_signal(signum);
+}
+
 OSD *osd = NULL;
+
+extern bool g_osdmap_decode_flag;//balance modify by yueyuanfang
 
 void handle_osd_signal(int signum)
 {
@@ -107,6 +117,140 @@ int preload_erasure_code()
   return r;
 }
 
+int run_as_admin()
+{
+  if (g_osd_manager->init() < 0) {
+    exit(1);
+  }
+
+  global_init_daemonize(g_ceph_context);
+  common_init_finish(g_ceph_context);
+
+  TracepointProvider::initialize<osd_tracepoint_traits>(g_ceph_context);
+  TracepointProvider::initialize<os_tracepoint_traits>(g_ceph_context);
+
+  global_init_chdir(g_ceph_context);
+
+  if (preload_erasure_code() < 0) {
+    exit(1);
+  }
+
+  g_osd_manager->start();
+
+  // install singnal handlers
+  init_async_signal_handler();
+  register_async_signal_handler(SIGHUP, sighup_handler);
+  register_async_signal_handler_oneshot(SIGINT, handle_admin_signal);
+  register_async_signal_handler_oneshot(SIGTERM, handle_admin_signal);
+
+  g_osd_manager->final_init();
+
+  pid_t pid = ::getpid();
+  if (g_conf->inject_early_sigterm)
+    kill(pid, SIGTERM);
+
+  g_osd_manager->wait();
+
+  unregister_async_signal_handler(SIGHUP, sighup_handler);
+  unregister_async_signal_handler(SIGINT, handle_admin_signal);
+  unregister_async_signal_handler(SIGTERM, handle_admin_signal);
+  shutdown_async_signal_handler();
+
+  // done
+  delete g_osd_manager;
+  derr << "exit admin process" << dendl;
+  g_ceph_context->put();
+
+  char s[20];
+  snprintf(s, sizeof(s), "gmon/%d", pid);
+  if ((mkdir(s, 0755) == 0) && (chdir(s) == 0)) {
+    cerr << "ceph-osd: gmon.out should be in " << s << std::endl;
+  }
+
+  return 0;
+}
+
+OSDPseudo *g_osd_pseudo = nullptr;
+void handle_pseudo_signal(int signum)
+{
+   if (g_osd_pseudo)
+    g_osd_pseudo->handle_signal(signum);
+}
+
+int run_as_pseudo()
+{
+  g_osd_pseudo = new OSDPseudo();
+  if (g_osd_pseudo->init() < 0) {
+    exit(1);
+  }
+  
+  global_init_daemonize(g_ceph_context);
+
+  g_osd_pseudo->start();
+
+  // install singnal handlers
+  init_async_signal_handler();
+  register_async_signal_handler(SIGHUP, sighup_handler);
+  register_async_signal_handler_oneshot(SIGINT, handle_pseudo_signal);
+  register_async_signal_handler_oneshot(SIGTERM, handle_pseudo_signal);
+
+  g_osd_pseudo->final_init();
+
+  pid_t pid = ::getpid();
+  if (g_conf->inject_early_sigterm)
+    kill(pid, SIGTERM);
+
+  g_osd_pseudo->wait();
+
+  unregister_async_signal_handler(SIGHUP, sighup_handler);
+  unregister_async_signal_handler(SIGINT, handle_pseudo_signal);
+  unregister_async_signal_handler(SIGTERM, handle_pseudo_signal);
+  shutdown_async_signal_handler();
+
+  // done
+  delete g_osd_pseudo;
+  derr << "exit pseudo process" << dendl;
+  g_ceph_context->put();
+
+  char s[20];
+  snprintf(s, sizeof(s), "gmon/%d", pid);
+  if ((mkdir(s, 0755) == 0) && (chdir(s) == 0)) {
+    cerr << "ceph-osd: gmon.out should be in " << s << std::endl;
+  }
+
+  if(g_osd_pseudo->get_osd_state() != 0) {
+    exit(1);
+  }
+  
+  return 0;
+}
+
+#undef dout_prefix
+#define dout_prefix *_dout << __func__ << " "
+
+class OSDFailureHandler: public FailureHandler {
+protected:
+  virtual void handle_failure(int err, const char *desc);
+};
+
+
+void OSDFailureHandler::handle_failure(int err, const char *desc)
+{
+  if (err) {
+    derr << cpp_strerror(err) << ", " << desc << dendl;
+  } else {
+    derr << desc << dendl;
+  }
+
+  BackTrace bt(1);
+  dout(0);
+  bt.print(*_dout);
+  *_dout << dendl;
+
+  queue_async_signal(SIGINT);
+}
+
+
 int main(int argc, const char **argv) 
 {
   vector<const char*> args;
@@ -117,6 +261,10 @@ int main(int argc, const char **argv)
   // We want to enable leveldb's log, while allowing users to override this
   // option, therefore we will pass it as a default argument to global_init().
   def_args.push_back("--leveldb-log=");
+
+  // reserve args and def_args for admin process
+  vector<const char*> orig_args(args);
+  vector<const char*> orig_def_args(def_args);
 
   global_init(&def_args, args, CEPH_ENTITY_TYPE_OSD, CODE_ENVIRONMENT_DAEMON,
 	      0, "osd_data");
@@ -139,6 +287,7 @@ int main(int argc, const char **argv)
   string device_path;
   std::string dump_pg_log;
 
+  bool offline_task = false;
   std::string val;
   for (std::vector<const char*>::iterator i = args.begin(); i != args.end(); ) {
     if (ceph_argparse_double_dash(args, i)) {
@@ -147,28 +296,39 @@ int main(int argc, const char **argv)
       usage();
     } else if (ceph_argparse_flag(args, i, "--mkfs", (char*)NULL)) {
       mkfs = true;
+      offline_task = true;
     } else if (ceph_argparse_flag(args, i, "--mkjournal", (char*)NULL)) {
       mkjournal = true;
+      offline_task = true;
     } else if (ceph_argparse_flag(args, i, "--check-allows-journal", (char*)NULL)) {
       check_allows_journal = true;
+      offline_task = true;
     } else if (ceph_argparse_flag(args, i, "--check-wants-journal", (char*)NULL)) {
       check_wants_journal = true;
+      offline_task = true;
     } else if (ceph_argparse_flag(args, i, "--check-needs-journal", (char*)NULL)) {
       check_needs_journal = true;
+      offline_task = true;
     } else if (ceph_argparse_flag(args, i, "--mkkey", (char*)NULL)) {
       mkkey = true;
+      offline_task = true;
     } else if (ceph_argparse_flag(args, i, "--flush-journal", (char*)NULL)) {
       flushjournal = true;
+      offline_task = true;
     } else if (ceph_argparse_flag(args, i, "--convert-filestore", (char*)NULL)) {
       convertfilestore = true;
+      offline_task = true;
     } else if (ceph_argparse_witharg(args, i, &val, "--dump-pg-log", (char*)NULL)) {
       dump_pg_log = val;
     } else if (ceph_argparse_flag(args, i, "--dump-journal", (char*)NULL)) {
       dump_journal = true;
+      offline_task = true;
     } else if (ceph_argparse_flag(args, i, "--get-cluster-fsid", (char*)NULL)) {
       get_cluster_fsid = true;
+      offline_task = true;
     } else if (ceph_argparse_flag(args, i, "--get-osd-fsid", "--get-osd-uuid", (char*)NULL)) {
       get_osd_fsid = true;
+      offline_task = true;
     } else if (ceph_argparse_flag(args, i, "--get-journal-fsid", "--get-journal-uuid", (char*)NULL)) {
       get_journal_fsid = true;
     } else if (ceph_argparse_witharg(args, i, &device_path,
@@ -183,6 +343,8 @@ int main(int argc, const char **argv)
     usage();
   }
 
+  g_osdmap_decode_flag = g_conf->osd_map_decode_flag;//balance modify by yueyuanfang
+  
   if (get_journal_fsid) {
     device_path = g_conf->osd_journal;
     get_device_fsid = true;
@@ -223,6 +385,18 @@ int main(int argc, const char **argv)
       derr << "unable to open " << dump_pg_log << ": " << error << dendl;
     }
     return 0;
+  }
+
+  bool single_process = !offline_task && g_conf->osd_single_process;
+  if (single_process && !strncmp(g_conf->name.get_id().c_str(), "admin", 5)) {
+    g_osd_manager = new OSDManager(orig_args, orig_def_args);
+    return run_as_admin();
+  } else {
+    orig_args.clear();
+    orig_def_args.clear();
+    if (single_process) {
+      return run_as_pseudo();
+    }
   }
 
   // whoami
@@ -436,7 +610,7 @@ int main(int argc, const char **argv)
   }
 
   pick_addresses(g_ceph_context, CEPH_PICK_ADDRESS_PUBLIC
-                                |CEPH_PICK_ADDRESS_CLUSTER);
+                                |CEPH_PICK_ADDRESS_CLUSTER, whoami);
 
   if (g_conf->public_addr.is_blank_ip() && !g_conf->cluster_addr.is_blank_ip()) {
     derr << TEXT_YELLOW
@@ -527,10 +701,47 @@ int main(int argc, const char **argv)
 
   ms_objecter->set_default_policy(Messenger::Policy::lossy_client(0, CEPH_FEATURE_OSDREPLYMUX));
 
-  r = ms_public->bind(g_conf->public_addr);
+  entity_addr_t public_addr = g_conf->public_addr;
+#ifdef HAVE_RDMA
+  uint16_t disk_count = 36;
+  uint16_t port_min = g_conf->ms_bind_port_min;
+  //uint16_t port_max = g_conf->ms_bind_port_max;
+  uint16_t portthreads = g_conf->xio_portal_threads;
+  uint16_t iport = 0;
+  iport = (whoami%disk_count)*(portthreads*5 + 5) + port_min + 100;
+  if(public_addr.is_blank_ip())
+      public_addr = g_conf->cluster_addr;
+  if(public_addr.is_ip())
+      public_addr.set_port(iport);
+#endif
+  r = ms_public->bind(public_addr);
+#ifdef HAVE_RDMA
+  if(r < 0)
+  {
+    if(public_addr.is_ip())
+    public_addr.set_port(0);
+    r = ms_public->bind(public_addr);
+    dout(0) << "ceph-osd: bind failed r:" << r << " add " << public_addr << dendl;
+  }
+#endif
   if (r < 0)
     exit(1);
-  r = ms_cluster->bind(g_conf->cluster_addr);
+
+  entity_addr_t cluster_addr = g_conf->cluster_addr;
+#ifdef HAVE_RDMA
+  iport += portthreads;
+  if(cluster_addr.is_ip())
+    cluster_addr.set_port(iport);
+#endif
+  r = ms_cluster->bind(cluster_addr);
+#ifdef HAVE_RDMA
+  if(r < 0)
+  {
+    if(cluster_addr.is_ip())
+      cluster_addr.set_port(0);
+    r = ms_cluster->bind(cluster_addr);
+  }
+#endif
   if (r < 0)
     exit(1);
 
@@ -547,7 +758,20 @@ int main(int argc, const char **argv)
     if (hb_back_addr.is_ip())
       hb_back_addr.set_port(0);
   }
+#ifdef HAVE_RDMA
+  iport += portthreads;
+  if(hb_back_addr.is_ip())
+    hb_back_addr.set_port(iport);
+#endif
   r = ms_hb_back_server->bind(hb_back_addr);
+#ifdef HAVE_RDMA
+  if(r < 0)
+  {
+    if(hb_back_addr.is_ip())
+      hb_back_addr.set_port(0);
+    r = ms_hb_back_server->bind(hb_back_addr);
+  }
+#endif
   if (r < 0)
     exit(1);
 
@@ -555,7 +779,20 @@ int main(int argc, const char **argv)
   entity_addr_t hb_front_addr = g_conf->public_addr;
   if (hb_front_addr.is_ip())
     hb_front_addr.set_port(0);
+#ifdef HAVE_RDMA
+  iport += portthreads;
+  if(hb_front_addr.is_ip())
+    hb_front_addr.set_port(iport);
+#endif
   r = ms_hb_front_server->bind(hb_front_addr);
+#ifdef HAVE_RDMA
+  if(r < 0)
+  {
+    if(hb_front_addr.is_ip())
+      hb_front_addr.set_port(0);
+    r = ms_hb_front_server->bind(hb_front_addr);
+  }
+#endif
   if (r < 0)
     exit(1);
 
@@ -566,7 +803,7 @@ int main(int argc, const char **argv)
   TracepointProvider::initialize<osd_tracepoint_traits>(g_ceph_context);
   TracepointProvider::initialize<os_tracepoint_traits>(g_ceph_context);
 
-  MonClient mc(g_ceph_context);
+  MonClient mc(g_ceph_context, whoami);
   if (mc.build_initial_monmap() < 0)
     return -1;
   global_init_chdir(g_ceph_context);
@@ -593,6 +830,9 @@ int main(int argc, const char **argv)
 	 << TEXT_NORMAL << dendl;
     return 1;
   }
+
+  OSDFailureHandler osdFailure;
+  g_ceph_context->set_failure_handler(&osdFailure);
 
   ms_public->start();
   ms_hbclient->start();
@@ -640,7 +880,10 @@ int main(int argc, const char **argv)
   delete ms_hb_back_server;
   delete ms_cluster;
   delete ms_objecter;
-
+ 
+  int retVal =  g_ceph_context->is_failed()?-1:0;
+ 
+ 
   client_byte_throttler.reset();
   client_msg_throttler.reset();
   g_ceph_context->put();
@@ -649,8 +892,8 @@ int main(int argc, const char **argv)
   char s[20];
   snprintf(s, sizeof(s), "gmon/%d", getpid());
   if ((mkdir(s, 0755) == 0) && (chdir(s) == 0)) {
-    dout(0) << "ceph-osd: gmon.out should be in " << s << dendl;
+    cerr << "ceph-osd: gmon.out should be in " << s << std::endl;
   }
 
-  return 0;
+  return retVal;
 }

@@ -28,14 +28,13 @@ using namespace std;
 #include "include/types.h"
 #include "include/ceph_features.h"
 #include "auth/Crypto.h"
-
+#include "virtual_connection.h"
 #include <errno.h>
 #include <sstream>
 
 #define SOCKET_PRIORITY_MIN_DELAY 6
 
 class Timer;
-
 
 class Messenger {
 private:
@@ -174,6 +173,8 @@ public:
    */
   static Messenger *create_client_messenger(CephContext *cct, string lname);
 
+  /*edited by liyanbo  get  dispatcher*/
+
   /**
    * @defgroup Accessors
    * @{
@@ -184,13 +185,13 @@ public:
    * @return A const reference to the instance this Messenger
    * currently believes to be its own.
    */
-  const entity_inst_t& get_myinst() { return my_inst; }
+ virtual const entity_inst_t& get_myinst() { return my_inst; }
   /**
    * set messenger's instance
    */
   void set_myinst(entity_inst_t i) { my_inst = i; }
 
-  uint32_t get_magic() { return magic; }
+  virtual uint32_t get_magic() { return magic; }
   void set_magic(int _magic) { magic = _magic; }
 
   /**
@@ -199,7 +200,7 @@ public:
    * @return A const reference to the address this Messenger
    * currently believes to be its own.
    */
-  const entity_addr_t& get_myaddr() { return my_inst.addr; }
+  virtual const entity_addr_t& get_myaddr() { return my_inst.addr; }
 protected:
   /**
    * set messenger's address
@@ -212,7 +213,7 @@ public:
    * @return A const reference to the name this Messenger
    * currently believes to be its own.
    */
-  const entity_name_t& get_myname() { return my_inst.name; }
+  virtual const entity_name_t& get_myname() { return my_inst.name; }
   /**
    * Set the name of the local entity. The name is reported to others and
    * can be changed while the system is running, but doing so at incorrect
@@ -220,7 +221,7 @@ public:
    *
    * @param m The name to set.
    */
-  void set_myname(const entity_name_t& m) { my_inst.name = m; }
+  virtual void set_myname(const entity_name_t& m) { my_inst.name = m; }
   /**
    * Set the unknown address components for this Messenger.
    * This is useful if the Messenger doesn't know its full address just by
@@ -230,9 +231,9 @@ public:
    *
    * @param addr The address to use as a template.
    */
-  virtual void set_addr_unknowns(entity_addr_t &addr) = 0;
+  virtual void set_addr_unknowns(const entity_addr_t &addr) = 0;
   /// Get the default send priority.
-  int get_default_send_priority() { return default_send_priority; }
+  virtual int get_default_send_priority() { return default_send_priority; }
   /**
    * Get the number of Messages which the Messenger has received
    * but not yet dispatched.
@@ -323,7 +324,7 @@ public:
    *
    * @param p The cluster protocol to use. Defined externally.
    */
-  void set_default_send_priority(int p) {
+  virtual void set_default_send_priority(int p) {
     assert(!started);
     default_send_priority = p;
   }
@@ -337,7 +338,7 @@ public:
    * @param prio The priority. Setting a priority outside the range 0 to 6
    * requires the CAP_NET_ADMIN capability.
    */
-  void set_socket_priority(int prio) {
+  virtual void set_socket_priority(int prio) {
     socket_priority = prio;
   }
   /**
@@ -345,7 +346,7 @@ public:
    *
    * @return the socket priority
    */
-  int get_socket_priority() {
+  virtual int get_socket_priority() {
     return socket_priority;
   }
   /**
@@ -355,7 +356,7 @@ public:
    *
    * @param d The Dispatcher to insert into the list.
    */
-  void add_dispatcher_head(Dispatcher *d) { 
+ virtual void add_dispatcher_head(Dispatcher *d) { 
     bool first = dispatchers.empty();
     dispatchers.push_front(d);
     if (d->ms_can_fast_dispatch_any())
@@ -370,7 +371,7 @@ public:
    *
    * @param d The Dispatcher to insert into the list.
    */
-  void add_dispatcher_tail(Dispatcher *d) { 
+ virtual void add_dispatcher_tail(Dispatcher *d) { 
     bool first = dispatchers.empty();
     dispatchers.push_back(d);
     if (d->ms_can_fast_dispatch_any())
@@ -378,6 +379,7 @@ public:
     if (first)
       ready();
   }
+  virtual void delete_dispatch(int osd_id){};
   /**
    * Bind the Messenger to a specific address. If bind_addr
    * is not completely filled in the system will use the
@@ -455,7 +457,7 @@ public:
    * @return 0 on success, or -errno on failure.
    */
   virtual int send_message(Message *m, const entity_inst_t& dest) = 0;
-
+  virtual int send_message(Message *m, const entity_inst_t& src,const entity_inst_t& dest) {return send_message(m, dest);}
   /**
    * @} // Messaging
    */
@@ -471,11 +473,14 @@ public:
    *
    * @param dest The entity to get a connection for.
    */
-  virtual ConnectionRef get_connection(const entity_inst_t& dest) = 0;
+  virtual ConnectionRef get_connection(const entity_inst_t& dest)=0;
+  virtual ConnectionRef get_connection(const entity_inst_t& src, const entity_inst_t& dst) {return get_connection(dst);}
   /**
    * Get the Connection object associated with ourselves.
    */
-  virtual ConnectionRef get_loopback_connection() = 0;
+  virtual ConnectionRef get_loopback_connection()=0;
+  virtual ConnectionRef get_loopback_connection(const entity_inst_t& dst) {return get_loopback_connection();}
+
   /**
    * Mark down a Connection to a remote.
    *
@@ -493,7 +498,8 @@ public:
    *
    * @param a The address to mark down.
    */
-  virtual void mark_down(const entity_addr_t& a) = 0;
+  virtual void mark_down_impl(const entity_addr_t& a) = 0;
+  virtual void mark_down(const entity_addr_t & a, entity_inst_t src_osd, entity_inst_t dest_osd) {return mark_down_impl(a);}
   /**
    * Mark all the existing Connections down. This is equivalent
    * to iterating over all Connections and calling mark_down()
@@ -502,6 +508,7 @@ public:
    * This will generate a RESET event for each closed connections.
    */
   virtual void mark_down_all() = 0;
+  virtual void mark_down_all(int id) {return mark_down_all();}
   /**
    * @} // Connection Management
    */
@@ -530,7 +537,7 @@ public:
    *
    * @param m The Message we are testing.
    */
-  bool ms_can_fast_dispatch(Message *m) {
+bool ms_can_fast_dispatch(Message *m) {
     for (list<Dispatcher*>::iterator p = fast_dispatchers.begin();
 	 p != fast_dispatchers.end();
 	 ++p) {
@@ -546,7 +553,7 @@ public:
    * @param m The Message we are fast dispatching. We take ownership
    * of one reference to it.
    */
-  void ms_fast_dispatch(Message *m) {
+void ms_fast_dispatch(Message *m) {
     m->set_dispatch_stamp(ceph_clock_now(cct));
     for (list<Dispatcher*>::iterator p = fast_dispatchers.begin();
 	 p != fast_dispatchers.end();
@@ -561,7 +568,7 @@ public:
   /**
    *
    */
-  void ms_fast_preprocess(Message *m) {
+void ms_fast_preprocess(Message *m) {
     for (list<Dispatcher*>::iterator p = fast_dispatchers.begin();
 	 p != fast_dispatchers.end();
 	 ++p) {
@@ -576,7 +583,7 @@ public:
    *  @param m The Message to deliver. We take ownership of
    *  one reference to it.
    */
-  void ms_deliver_dispatch(Message *m) {
+void ms_deliver_dispatch(Message *m) {
     m->set_dispatch_stamp(ceph_clock_now(cct));
     for (list<Dispatcher*>::iterator p = dispatchers.begin();
 	 p != dispatchers.end();
@@ -596,7 +603,7 @@ public:
    *
    * @param con Pointer to the new Connection.
    */
-  void ms_deliver_handle_connect(Connection *con) {
+void ms_deliver_handle_connect(Connection *con) {
     for (list<Dispatcher*>::iterator p = dispatchers.begin();
 	 p != dispatchers.end();
 	 ++p)
@@ -610,7 +617,7 @@ public:
    *
    * @param con Pointer to the new Connection.
    */
-  void ms_deliver_handle_fast_connect(Connection *con) {
+void ms_deliver_handle_fast_connect(Connection *con) {
     for (list<Dispatcher*>::iterator p = fast_dispatchers.begin();
          p != fast_dispatchers.end();
          ++p)
@@ -623,7 +630,7 @@ public:
    *
    * @param con Pointer to the new Connection.
    */
-  void ms_deliver_handle_accept(Connection *con) {
+void ms_deliver_handle_accept(Connection *con) {
     for (list<Dispatcher*>::iterator p = dispatchers.begin();
 	 p != dispatchers.end();
 	 ++p)
@@ -636,7 +643,7 @@ public:
    *
    * @param con Pointer to the new Connection.
    */
-  void ms_deliver_handle_fast_accept(Connection *con) {
+void ms_deliver_handle_fast_accept(Connection *con) {
     for (list<Dispatcher*>::iterator p = fast_dispatchers.begin();
          p != fast_dispatchers.end();
          ++p)
@@ -650,7 +657,7 @@ public:
    *
    * @param con Pointer to the broken Connection.
    */
-  void ms_deliver_handle_reset(Connection *con) {
+void ms_deliver_handle_reset(Connection *con) {
     for (list<Dispatcher*>::iterator p = dispatchers.begin();
 	 p != dispatchers.end();
 	 ++p) {
@@ -665,12 +672,30 @@ public:
    *
    * @param con Pointer to the broken Connection.
    */
-  void ms_deliver_handle_remote_reset(Connection *con) {
+void ms_deliver_handle_remote_reset(Connection *con) {
     for (list<Dispatcher*>::iterator p = dispatchers.begin();
 	 p != dispatchers.end();
 	 ++p)
       (*p)->ms_handle_remote_reset(con);
   }
+
+  /**
+   * Notify each Dispatcher of a Connection for which reconnection
+   * attempts are being refused. Call this function whenever you
+   * detect that a lossy Connection has been disconnected and it's
+   * impossible to reconnect.
+   *
+   * @param con Pointer to the broken Connection.
+   */
+  void ms_deliver_handle_refused(Connection *con) {
+    for (list<Dispatcher*>::iterator p = dispatchers.begin();
+         p != dispatchers.end();
+         ++p) {
+      if ((*p)->ms_handle_refused(con))
+        return;
+    }
+  }
+
   /**
    * Get the AuthAuthorizer for a new outgoing Connection.
    *
@@ -702,7 +727,7 @@ public:
    * @return True if we were able to prove or disprove correctness of
    * authorizer, false otherwise.
    */
-  bool ms_deliver_verify_authorizer(Connection *con, int peer_type,
+bool ms_deliver_verify_authorizer(Connection *con, int peer_type,
 				    int protocol, bufferlist& authorizer, bufferlist& authorizer_reply,
 				    bool& isvalid, CryptoKey& session_key) {
     for (list<Dispatcher*>::iterator p = dispatchers.begin();
@@ -719,6 +744,16 @@ public:
    */
 };
 
+/*
+ * add this define only for get the caller information
+ * Notice: Messenger mark down overload, but now only use the first param,
+ * So if this logical is changed, need to modify here!
+ */
+#define msgr_mark_down(msgr, addr, params...)	\
+    do {						\
+      ldout(msgr->cct, 0) << "msgr_mark_down called, Caller:" << __func__ << dendl;	\
+      msgr->mark_down_impl(addr);		\
+    } while (0)
 
 
 #endif

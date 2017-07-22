@@ -194,7 +194,8 @@ private:
 
 public:
   void set_entity_name(EntityName name) { entity_name = name; }
-
+  int get_state(){ return state; }
+  string get_cur_mon(){ return cur_mon; }
   int _check_auth_tickets();
   int _check_auth_rotating();
   int wait_auth_rotating(double timeout);
@@ -302,6 +303,7 @@ public:
 
  public:
   explicit MonClient(CephContext *cct_);
+  explicit MonClient(CephContext *cct_, int id);
   ~MonClient();
 
   int init();
@@ -311,7 +313,7 @@ public:
     log_client = clog;
   }
 
-  int build_initial_monmap();
+  int build_initial_monmap(ostream *errout = nullptr);
   int get_monmap();
   int get_monmap_privately();
   /**

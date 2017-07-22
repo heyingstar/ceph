@@ -165,7 +165,10 @@ int FileStore::get_cdir(const coll_t& cid, char *s, int len)
 int FileStore::get_index(const coll_t& cid, Index *index)
 {
   int r = index_manager.get_index(cid, basedir, index);
-  assert(!m_filestore_fail_eio || r != -EIO);
+  if (r == -EIO) {
+    derr << "FileStore::get_index(" << cid << ") got EIO" << dendl;
+    local_assert(!m_filestore_fail_eio);
+  }
   return r;
 }
 
@@ -174,7 +177,10 @@ int FileStore::init_index(const coll_t& cid)
   char path[PATH_MAX];
   get_cdir(cid, path, sizeof(path));
   int r = index_manager.init_index(cid, path, target_version);
-  assert(!m_filestore_fail_eio || r != -EIO);
+  if (r == -EIO) {
+    derr << "FileStore::init_index(" << cid << ") got EIO" << dendl;
+    local_assert(!m_filestore_fail_eio);
+  }
   return r;
 }
 

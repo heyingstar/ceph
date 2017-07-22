@@ -29,11 +29,19 @@ class CephContext;
 
 class Dispatcher {
 public:
+  int osd_id;
   explicit Dispatcher(CephContext *cct_)
-    : cct(cct_)
+    : osd_id(-1),cct(cct_)
+  {
+  }
+
+  explicit Dispatcher(CephContext *cct_, int id)
+    : osd_id(id),cct(cct_)
   {
   }
   virtual ~Dispatcher() { }
+
+  int get_id(){return osd_id;}
 
   /**
    * The Messenger calls this function to query if you are capable
@@ -157,6 +165,16 @@ public:
   virtual void ms_handle_remote_reset(Connection *con) = 0;
   
   /**
+   * This indicates that the connection is both broken and further
+   * connection attempts are failing because other side refuses
+   * it.
+   *
+   * @param con The Connection which broke. You are not granted
+   * a reference to it.
+   */
+  virtual bool ms_handle_refused(Connection *con) { return false; };
+
+  /**
    * @defgroup Authentication
    * @{
    */
@@ -195,6 +213,13 @@ public:
 				    ceph::bufferlist& authorizer_reply,
 				    bool& isvalid,
 				    CryptoKey& session_key) { return false; }
+  virtual bool ms_verify_authorizer(Connection *con,
+				    int peer_type,
+				    int protocol,
+				    ceph::bufferlist& authorizer,
+				    ceph::bufferlist& authorizer_reply,
+				    bool& isvalid,
+				    CryptoKey& session_key,int type) { return false; }
   /**
    * @} //Authentication
    */

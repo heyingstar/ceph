@@ -203,7 +203,7 @@ bool OpTracker::check_ops_in_flight(std::vector<string> &warning_vector)
 
   utime_t oldest_secs = now - oldest_op;
 
-  dout(10) << "ops_in_flight.size: " << total_ops_in_flight
+  ldout(cct, 10) << "ops_in_flight.size: " << total_ops_in_flight
            << "; oldest is " << oldest_secs
            << " seconds old" << dendl;
 
@@ -289,7 +289,7 @@ void OpTracker::mark_event(TrackedOp *op, const string &dest, utime_t time)
 void OpTracker::_mark_event(TrackedOp *op, const string &evt,
 			    utime_t time)
 {
-  dout(5);
+  ldout(cct, 5);
   *_dout  <<  "seq: " << op->seq
 	  << ", time: " << time << ", event: " << evt
 	  << ", op: ";
@@ -314,7 +314,7 @@ void TrackedOp::mark_event(const string &event)
   if (!is_tracked)
     return;
 
-  utime_t now = ceph_clock_now(g_ceph_context);
+  utime_t now = ceph_clock_now(tracker->cct);
   {
     Mutex::Locker l(lock);
     events.push_back(make_pair(now, event));

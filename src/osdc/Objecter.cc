@@ -63,7 +63,7 @@ using ceph::timespan;
 #undef dout_prefix
 #define dout_prefix *_dout << messenger->get_myname() << ".objecter "
 
-
+extern bool g_osdmap_decode_flag; //balance modify by yueyuanfang
 enum {
   l_osdc_first = 123200,
   l_osdc_op_active,
@@ -352,7 +352,14 @@ void Objecter::init()
 
   cct->_conf->add_observer(this);
 
+  if (messenger->get_myname().type() == entity_name_t::TYPE_MDS)
+    mds_max_optimized_ops_per_osd = cct->_conf->mds_max_optimized_ops_per_osd;
+  else
+    mds_max_optimized_ops_per_osd = 0;
+
   initialized.set(1);
+//balance modify by yueyuanfang
+  g_osdmap_decode_flag = cct->_conf->osd_map_decode_flag;
 }
 
 /*
@@ -377,6 +384,8 @@ void Objecter::shutdown()
   unique_lock wl(rwlock);
 
   initialized.set(0);
+
+  mds_max_optimized_ops_per_osd = 0;
 
   cct->_conf->remove_observer(this);
 
@@ -445,6 +454,21 @@ void Objecter::shutdown()
     {
       OSDSession::unique_lock swl(homeless_session->lock);
       _session_op_remove(homeless_session, op);
+    }
+    op->put();
+  }
+
+  while (homeless_session->todo_ops.size()) { // flc added for quickdelete
+    auto i = homeless_session->todo_ops.begin();
+    ldout(cct, 10) << " op " << *i << dendl;
+    Op *op = *i;
+    {
+      OSDSession::unique_lock swl(homeless_session->lock);
+      homeless_session->todo_ops.erase(i);
+    }
+    if (op->session) {
+      put_session(op->session);
+      op->session = NULL;
     }
     op->put();
   }
@@ -1303,6 +1327,82 @@ void Objecter::handle_osd_map(MOSDMap *m)
   if (!waiting_for_map.empty()) {
     _maybe_request_map();
   }
+
+  if (mds_max_optimized_ops_per_osd > 0) { // flc added for quickdelete
+    map<int, list<Op*> > need_move;
+    for (auto & si : osd_sessions) {
+      _calc_todo_ops_target(si.second, need_move);
+    }
+    _calc_todo_ops_target(homeless_session, need_move);
+
+    for (auto & mi : need_move) {
+      OSDSession *s = NULL;
+      int r = _get_session(mi.first, &s, sul);
+      assert(r == 0);
+      assert(s);
+
+      OSDSession::unique_lock slock(s->lock);
+      for (Op *op : mi.second) {
+        assert(op->session == NULL);
+        op->session = s;
+        get_session(s);
+        s->todo_ops.push_back(op);
+      }
+      slock.unlock();
+      put_session(s);
+    }
+    need_move.clear();
+
+    for (auto & si : osd_sessions) {
+      OSDSession *s = si.second;  
+      while (true) {
+        Op *ptodo_op = NULL;
+        OSDSession::unique_lock slock(s->lock);
+        ldout(cct, 1) << "handle_osd_map osd_id=" << s->osd
+             << " optimized_ops_progressing=" << s->optimized_ops_progressing
+             << "," << mds_max_optimized_ops_per_osd
+             << " todo_ops.size()=" << s->todo_ops.size() << dendl;
+        if (s->optimized_ops_progressing < mds_max_optimized_ops_per_osd && 
+            s->todo_ops.size()) {
+          ptodo_op = s->todo_ops.front();
+          s->todo_ops.pop_front();
+        }
+        slock.unlock();
+
+        if (ptodo_op)
+          _op_submit(ptodo_op, sul, NULL);
+        else
+          break;
+      }
+    }
+  }
+}
+
+void Objecter::_calc_todo_ops_target(OSDSession *s, map<int, list<Op*> >& need_move)
+{
+  assert(s);
+
+  OSDSession::unique_lock swl(s->lock);
+  if (s->todo_ops.empty())
+    return;
+
+  for (auto itor = s->todo_ops.begin(); itor != s->todo_ops.end(); ) {
+    Op *op =  *itor;
+    int osd = op->target.osd;
+    _calc_target(&(op->target));
+
+    if (osd != op->target.osd) {
+      if (op->session) {
+        put_session(op->session);
+        op->session = NULL;
+      }
+
+      need_move[op->target.osd].push_back(op);
+      itor = s->todo_ops.erase(itor);
+    } else {
+      itor++;
+    }
+  }
 }
 
 // op pool check
@@ -1663,7 +1763,16 @@ int Objecter::_get_session(int osd, OSDSession **session, shunique_lock& sul)
   }
   OSDSession *s = new OSDSession(cct, osd);
   osd_sessions[osd] = s;
-  s->con = messenger->get_connection(osdmap->get_inst(osd));
+  if(-1 == get_id())
+  {
+  	s->con = messenger->get_connection(osdmap->get_inst(osd));
+  }
+  else
+  {
+ 	entity_inst_t src_inst = messenger->get_myinst();
+  	src_inst.name._num = get_id();
+	s->con = messenger->get_connection(src_inst, osdmap->get_inst(osd));
+  }
   logger->inc(l_osdc_osd_session_open);
   logger->inc(l_osdc_osd_sessions, osd_sessions.size());
   s->get();
@@ -1701,10 +1810,19 @@ void Objecter::_reopen_session(OSDSession *s)
   ldout(cct, 10) << "reopen_session osd." << s->osd << " session, addr now "
 		 << inst << dendl;
   if (s->con) {
-    s->con->mark_down();
+    conn_mark_down(s->con);
     logger->inc(l_osdc_osd_session_close);
   }
-  s->con = messenger->get_connection(inst);
+  if(-1 == get_id())
+  {
+  	s->con = messenger->get_connection(inst);
+  }
+  else
+  {
+  	entity_inst_t src_inst = messenger->get_myinst();
+  	src_inst.name._num = get_id();
+	s->con = messenger->get_connection(src_inst, inst);
+  }
   s->incarnation++;
   logger->inc(l_osdc_osd_session_open);
 }
@@ -1715,7 +1833,7 @@ void Objecter::close_session(OSDSession *s)
 
   ldout(cct, 10) << "close_session for osd." << s->osd << dendl;
   if (s->con) {
-    s->con->mark_down();
+    conn_mark_down(s->con);
     logger->inc(l_osdc_osd_session_close);
   }
   OSDSession::unique_lock sl(s->lock);
@@ -1745,6 +1863,18 @@ void Objecter::close_session(OSDSession *s)
     _session_command_op_remove(s, i->second);
   }
 
+  while (s->todo_ops.size()) { // flc added for quickdelete
+    Op *op = s->todo_ops.front();
+    if (op->tid == 0)
+      op->tid = last_tid.inc();
+    homeless_ops.push_back(op);
+    if (op->session) {
+      put_session(op->session);
+      op->session = NULL;
+    }
+    s->todo_ops.pop_front();
+  }
+
   osd_sessions.erase(s->osd);
   sl.unlock();
   put_session(s);
@@ -1756,9 +1886,11 @@ void Objecter::close_session(OSDSession *s)
 	 i != homeless_lingers.end(); ++i) {
       _session_linger_op_assign(homeless_session, *i);
     }
-    for (std::list<Op*>::iterator i = homeless_ops.begin();
-	 i != homeless_ops.end(); ++i) {
-      _session_op_assign(homeless_session, *i);
+    // flc modified for quickdelete
+    for (Op *op : homeless_ops) {
+      op->session = homeless_session;
+      get_session(homeless_session);
+      homeless_session->todo_ops.push_back(op);
     }
     for (std::list<CommandOp*>::iterator i = homeless_commands.begin();
 	 i != homeless_commands.end(); ++i) {
@@ -2256,24 +2388,54 @@ void Objecter::_op_submit(Op *op, shunique_lock& sul, ceph_tid_t *ptid)
 
   ldout(cct, 10) << __func__ << " op " << op << dendl;
 
-  // pick target
-  assert(op->session == NULL);
+  // flc modified for quickdelete
+  bool check_for_latest_map(false);
   OSDSession *s = NULL;
+  if (mds_max_optimized_ops_per_osd == 0 || op->session == NULL) {
+    // pick target
+    assert(op->session == NULL);
 
-  bool const check_for_latest_map = _calc_target(&op->target,
-						 &op->last_force_resend)
-    == RECALC_OP_TARGET_POOL_DNE;
+    check_for_latest_map = _calc_target(&op->target, &op->last_force_resend) == RECALC_OP_TARGET_POOL_DNE;
 
-  // Try to get a session, including a retry if we need to take write lock
-  int r = _get_session(op->target.osd, &s, sul);
-  if (r == -EAGAIN) {
-    assert(s == NULL);
-    sul.unlock();
-    sul.lock();
-    r = _get_session(op->target.osd, &s, sul);
+    // Try to get a session, including a retry if we need to take write lock
+    int r = _get_session(op->target.osd, &s, sul);
+    if (r == -EAGAIN) {
+      assert(s == NULL);
+      sul.unlock();
+      sul.lock();
+      r = _get_session(op->target.osd, &s, sul);
+    }
+    assert(r == 0);
+  } else {
+    s = op->session;
+    op->session = NULL;
   }
-  assert(r == 0);
   assert(s);  // may be homeless
+
+  if (op->is_mds_optimized) { // flc added for quickdelete
+    OSDSession::unique_lock sl(s->lock);
+    ldout(cct, 10) << "_op_submit osd_id=" << s->osd
+         << " optimized_ops_progressing=" << s->optimized_ops_progressing
+         << "," << mds_max_optimized_ops_per_osd
+         << " todo_ops.size()=" << s->todo_ops.size() << dendl;
+    if (s->optimized_ops_progressing >= mds_max_optimized_ops_per_osd || s->is_homeless()) {
+      s->todo_ops.push_back(op);
+      op->session = s;
+      sl.unlock();
+      return;
+    } else {
+      if (op->tid == 0)
+        op->tid = last_tid.inc();
+      _session_op_assign(s, op);
+      sl.unlock();
+    }
+  } else {
+    if (op->tid == 0)
+      op->tid = last_tid.inc();
+    OSDSession::unique_lock sl(s->lock);
+    _session_op_assign(s, op);
+    sl.unlock();
+ }
 
   // We may need to take wlock if we will need to _set_op_map_check later.
   if (check_for_latest_map && sul.owns_lock_shared()) {
@@ -2322,16 +2484,6 @@ void Objecter::_op_submit(Op *op, shunique_lock& sul, ceph_tid_t *ptid)
   }
 
   OSDSession::unique_lock sl(s->lock);
-  if (op->tid == 0)
-    op->tid = last_tid.inc();
-
-  ldout(cct, 10) << "_op_submit oid " << op->target.base_oid
-		 << " '" << op->target.base_oloc << "' '"
-		 << op->target.target_oloc << "' " << op->ops << " tid "
-		 << op->tid << " osd." << (!s->is_homeless() ? s->osd : -1)
-		 << dendl;
-
-  _session_op_assign(s, op);
 
   if (need_send) {
     _send_op(op, m);
@@ -2813,6 +2965,8 @@ void Objecter::_session_op_assign(OSDSession *to, Op *op)
 
   if (to->is_homeless()) {
     num_homeless_ops.inc();
+  } else if (op->is_mds_optimized) { // flc added for quickdelete
+    to->optimized_ops_progressing++;
   }
 
   ldout(cct, 15) << __func__ << " " << to->osd << " " << op->tid << dendl;
@@ -2825,6 +2979,8 @@ void Objecter::_session_op_remove(OSDSession *from, Op *op)
 
   if (from->is_homeless()) {
     num_homeless_ops.dec();
+  } else if (op->is_mds_optimized) { // flc added for quickdelete
+    from->optimized_ops_progressing--;
   }
 
   from->ops.erase(op->tid);
@@ -3327,10 +3483,27 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
     (op->target.base_oid.name.size() ? s->get_lock(op->target.base_oid) :
      OSDSession::unique_completion_lock());
 
+  Op *ptodo_op = NULL;
   // done with this tid?
   if (!op->onack && !op->oncommit && !op->oncommit_sync) {
     ldout(cct, 15) << "handle_osd_op_reply completed tid " << tid << dendl;
+    bool _is_optimized_op = op->is_mds_optimized;
     _finish_op(op, 0);
+
+    // flc added for quickdelete
+    if (mds_max_optimized_ops_per_osd > s->optimized_ops_progressing && s->todo_ops.size()) {
+      ldout(cct, 10) << "handle_osd_op_reply osd_id=" << s->osd
+           << " optimized_ops_progressing=" << s->optimized_ops_progressing
+           << ", " << mds_max_optimized_ops_per_osd
+           << " s->todo_ops.size()=" << s->todo_ops.size() << dendl;
+      ptodo_op = s->todo_ops.front();
+      s->todo_ops.pop_front();
+    } else if (_is_optimized_op && s->optimized_ops_progressing == 0 && s->todo_ops.empty()) {
+      ldout(cct, 10) << "handle_osd_op_reply osd_id=" << s->osd
+           << " optimized_ops_progressing=" << s->optimized_ops_progressing
+           << ", " << mds_max_optimized_ops_per_osd
+           << " s->todo_ops is empty" << dendl;
+    }
   }
 
   ldout(cct, 5) << num_unacked.read() << " unacked, " << num_uncommitted.read()
@@ -3355,6 +3528,10 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
 
   m->put();
   put_session(s);
+
+  if (ptodo_op) { // flc added for quickdelete
+    op_submit(ptodo_op);
+  }
 }
 
 
@@ -4252,7 +4429,13 @@ bool Objecter::ms_handle_reset(Connection *con)
   if (!initialized.read())
     return false;
   if (con->get_peer_type() == CEPH_ENTITY_TYPE_OSD) {
-    int osd = osdmap->identify_osd(con->get_peer_addr());
+  	int osd = con->get_osd_num();
+	if(osd < 0)
+	{
+	    osd = osdmap->identify_osd(con->get_peer_addr());
+	}
+    ldout(cct, 10) << __func__ << "osd." << osd << dendl; 
+	
     if (osd >= 0) {
       ldout(cct, 1) << "ms_handle_reset on osd." << osd << dendl;
       unique_lock wl(rwlock);

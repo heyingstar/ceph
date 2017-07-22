@@ -4,7 +4,7 @@
 #include <thread>
 #include "include/types.h"
 #include "Messenger.h"
-
+#include "msg/virtual_messenger.h"
 #include "msg/simple/SimpleMessenger.h"
 #include "msg/async/AsyncMessenger.h"
 #ifdef HAVE_XIO
@@ -24,15 +24,25 @@ Messenger *Messenger::create(CephContext *cct, const string &type,
 			     uint64_t nonce, uint64_t features)
 {
   int r = -1;
+  if (cct->_conf->osd_single_process)
+  	return new virtual_messenger(cct, name, lname, nonce, features);
+  
   if (type == "random") {
     thread_local unsigned seed = (unsigned) time(nullptr) +
       (unsigned) std::hash<std::thread::id>()(std::this_thread::get_id());
     r = rand_r(&seed) % 2; // random does not include xio
   }
-  if (r == 0 || type == "simple")
-    return new SimpleMessenger(cct, name, lname, nonce, features);
-  else if (r == 1 || type == "async")
-    return new AsyncMessenger(cct, name, lname, nonce, features);
+  if ((0 == r || "simple" == type) ||
+    ("mix" == type
+    && "hbclient" != lname
+    && "hb_back_server" != lname
+    && "cluster" != lname
+    && "ms_objecter" != lname))
+  {
+      return new SimpleMessenger(cct, name, lname, nonce, features);
+  }
+  else if (r == 1 || "async" == type || "mix" == type)
+    return new AsyncMessenger(cct, name, lname, nonce, features);  	
 #ifdef HAVE_XIO
   else if ((type == "xio") &&
 	   cct->check_experimental_feature_enabled("ms-type-xio"))

@@ -59,6 +59,8 @@ using namespace std;
 #include "messages/MOSDOp.h"
 #include "include/Spinlock.h"
 
+#include "messages/MShutDownAllOsd.h" //add by zhanghao
+
 #define CEPH_OSD_PROTOCOL    10 /* cluster internal */
 
 
@@ -587,7 +589,8 @@ public:
     con->send_message(m);
   }
   entity_name_t get_cluster_msgr_name() {
-    return cluster_messenger->get_myname();
+    //return cluster_messenger->get_myname();
+    return entity_name_t::OSD(whoami);
   }
 
   // -- scrub scheduling --
@@ -595,6 +598,7 @@ public:
   int scrubs_pending;
   int scrubs_active;
   struct ScrubJob {
+    CephContext *cct;
     /// pg to be scrubbed
     spg_t pgid;
     /// a time scheduled for scrub. but the scrub could be delayed if system
@@ -602,8 +606,8 @@ public:
     utime_t sched_time;
     /// the hard upper bound of scrub time
     utime_t deadline;
-    ScrubJob() {}
-    explicit ScrubJob(const spg_t& pg, const utime_t& timestamp,
+    ScrubJob(CephContext *_cct) : cct(_cct) {}
+    explicit ScrubJob(CephContext *_cct, const spg_t& pg, const utime_t& timestamp,
 		      double pool_scrub_min_interval = 0,
 		      double pool_scrub_max_interval = 0, bool must = true);
     /// order the jobs by sched_time
@@ -614,7 +618,7 @@ public:
   /// @returns the scrub_reg_stamp used for unregister the scrub job
   utime_t reg_pg_scrub(spg_t pgid, utime_t t, double pool_scrub_min_interval,
 		       double pool_scrub_max_interval, bool must) {
-    ScrubJob scrub(pgid, t, pool_scrub_min_interval, pool_scrub_max_interval,
+    ScrubJob scrub(cct, pgid, t, pool_scrub_min_interval, pool_scrub_max_interval,
 		   must);
     Mutex::Locker l(sched_scrub_lock);
     sched_scrub_pg.insert(scrub);
@@ -622,7 +626,7 @@ public:
   }
   void unreg_pg_scrub(spg_t pgid, utime_t t) {
     Mutex::Locker l(sched_scrub_lock);
-    size_t removed = sched_scrub_pg.erase(ScrubJob(pgid, t));
+    size_t removed = sched_scrub_pg.erase(ScrubJob(cct, pgid, t));
     assert(removed);
   }
   bool first_scrub_stamp(ScrubJob *out) {
@@ -1049,11 +1053,11 @@ public:
   }
   void dump_live_pgids() {
     Mutex::Locker l(pgid_lock);
-    derr << "live pgids:" << dendl;
+    lderr(cct) << "live pgids:" << dendl;
     for (map<spg_t, int>::iterator i = pgid_tracker.begin();
 	 i != pgid_tracker.end();
 	 ++i) {
-      derr << "\t" << *i << dendl;
+      lderr(cct) << "\t" << *i << dendl;
       live_pgs[i->first]->dump_live_ids();
     }
   }
@@ -1136,6 +1140,7 @@ protected:
 
   Cond dispatch_cond;
   int dispatch_running;
+  bool share_messengers; // for shared messengers
 
   void create_logger();
   void create_recoverystate_perf();
@@ -1193,7 +1198,7 @@ public:
     hobject_t oid(sobject_t("infos", CEPH_NOSNAP));
     return ghobject_t(oid);
   }
-  static void recursive_remove_collection(ObjectStore *store,
+  static int recursive_remove_collection(CephContext *cct, ObjectStore *store,
 					  spg_t pgid,
 					  coll_t tmp);
 
@@ -1225,7 +1230,7 @@ private:
   void write_superblock(ObjectStore::Transaction& t);
   int read_superblock();
 
-  void clear_temp_objects();
+  int clear_temp_objects();
 
   CompatSet osd_compat;
 
@@ -1280,6 +1285,12 @@ public:
   bool is_waiting_for_healthy() {
     return get_state() == STATE_WAITING_FOR_HEALTHY;
   }
+  bool should_drop_message() {
+    // for shared messengers, we should DROP message before STATE_PREBOOT
+    // because osd has not joined into the cluster yet
+    int _state = get_state();
+    return (_state == STATE_INITIALIZING) || (_state == STATE_STOPPING);
+  }
 
 private:
 
@@ -1288,6 +1299,8 @@ private:
   ThreadPool recovery_tp;
   ThreadPool disk_tp;
   ThreadPool command_tp;
+  ThreadPool msg_tp; // for shared messengers
+  ThreadPool hb_msg_tp; // for shared messengers, handle heartbeat messages
 
   bool paused_recovery;
 
@@ -1514,6 +1527,7 @@ private:
   // -- heartbeat --
   /// information about a heartbeat peer
   struct HeartbeatInfo {
+    Mutex lock;
     int peer;           ///< peer
     ConnectionRef con_front;   ///< peer connection (front)
     ConnectionRef con_back;    ///< peer connection (back)
@@ -1522,6 +1536,13 @@ private:
     utime_t last_rx_front;  ///< last time we got a ping reply on the front side
     utime_t last_rx_back;   ///< last time we got a ping reply on the back side
     epoch_t epoch;      ///< most recent epoch we wanted this peer
+
+    HeartbeatInfo(int p): lock("HeartbeatInfo::lock"), peer(p) {}
+
+    ~HeartbeatInfo() {
+      assert(!con_front);
+      assert(!con_back);
+    }
 
     bool is_unhealthy(utime_t cutoff) {
       return
@@ -1536,43 +1557,54 @@ private:
       return last_rx_front > cutoff && last_rx_back > cutoff;
     }
 
+    void destroy() {
+      Mutex::Locker l(lock);
+      if (con_back) {
+        con_back->mark_down_impl();
+        con_back.reset();
+      }
+      if (con_front) {
+        con_front->mark_down_impl();
+        con_front.reset();
+      }
+    }
   };
   /// state attached to outgoing heartbeat connections
   struct HeartbeatSession : public RefCountedObject {
     int peer;
     explicit HeartbeatSession(int p) : peer(p) {}
   };
-  Mutex heartbeat_lock;
+
+  Mutex debug_heartbeat_lock;
   map<int, int> debug_heartbeat_drops_remaining;
+
+  Mutex heartbeat_lock;
   Cond heartbeat_cond;
   bool heartbeat_stop;
-  Mutex heartbeat_update_lock; // orders under heartbeat_lock
+
   bool heartbeat_need_update;   ///< true if we need to refresh our heartbeat peers
-  map<int,HeartbeatInfo> heartbeat_peers;  ///< map of osd id to HeartbeatInfo
+  bool heartbeat_is_updating; ///< true if we are updating heartbeat peers
+
+  typedef ceph::shared_ptr<HeartbeatInfo> HeartbeatInfoRef;
+  map<int, HeartbeatInfoRef> heartbeat_peers;  ///< map of osd id to HeartbeatInfo
   utime_t last_mon_heartbeat;
   Messenger *hbclient_messenger;
   Messenger *hb_front_server_messenger;
   Messenger *hb_back_server_messenger;
   utime_t last_heartbeat_resample;   ///< last time we chose random peers in waiting-for-healthy state
   double daily_loadavg;
-  
-  void _add_heartbeat_peer(int p);
-  void _remove_heartbeat_peer(int p);
+  utime_t last_heartbeat_check; ///< last time we do heartbeat checks
+
+  void _dump_heartbeat_peers(map<int, HeartbeatInfoRef>& peers) {
+    Mutex::Locker l(heartbeat_lock);
+    peers = heartbeat_peers;
+  }
+
+  HeartbeatInfoRef _get_heartbeat_peer(int p, bool remove = false);
+  bool _add_heartbeat_peer(int p);
   bool heartbeat_reset(Connection *con);
   void maybe_update_heartbeat_peers();
   void reset_heartbeat_peers();
-  bool heartbeat_peers_need_update() {
-    Mutex::Locker l(heartbeat_update_lock);
-    return heartbeat_need_update;
-  }
-  void heartbeat_set_peers_need_update() {
-    Mutex::Locker l(heartbeat_update_lock);
-    heartbeat_need_update = true;
-  }
-  void heartbeat_clear_peers_need_update() {
-    Mutex::Locker l(heartbeat_update_lock);
-    heartbeat_need_update = false;
-  }
   void heartbeat();
   void heartbeat_check();
   void heartbeat_entry();
@@ -1593,11 +1625,29 @@ private:
   } heartbeat_thread;
 
 public:
+  void heartbeat_fast_dispatch(Message *m);
   bool heartbeat_dispatch(Message *m);
 
   struct HeartbeatDispatcher : public Dispatcher {
     OSD *osd;
-    explicit HeartbeatDispatcher(OSD *o) : Dispatcher(o->cct), osd(o) {}
+    explicit HeartbeatDispatcher(OSD *o) : Dispatcher(o->cct, o->osd_id), osd(o) {}
+    bool ms_can_fast_dispatch_any() const { return osd->share_messengers; }
+    bool ms_can_fast_dispatch(Message *m) const {
+      if (osd->share_messengers) {
+        switch (m->get_type()) {
+        case CEPH_MSG_PING:
+        case MSG_OSD_PING:
+        case CEPH_MSG_OSD_MAP:
+          return true;
+        default:
+          return false;
+        }
+      }
+      return false;
+    }
+    void ms_fast_dispatch(Message *m) {
+      osd->heartbeat_fast_dispatch(m);
+    }
     bool ms_dispatch(Message *m) {
       return osd->heartbeat_dispatch(m);
     }
@@ -1974,8 +2024,9 @@ protected:
     epoch_t epoch,
     PG::CephPeeringEvtRef evt);
   
-  void load_pgs();
-  void build_past_intervals_parallel();
+  int load_pgs();
+  void unload_pgs();
+  int build_past_intervals_parallel();
 
   /// project pg history from from to now
   bool project_pg_history(
@@ -2065,6 +2116,7 @@ protected:
   void got_full_map(epoch_t e);
 
   // -- failures --
+  Mutex failure_lock;
   map<int,utime_t> failure_queue;
   map<int,pair<utime_t,entity_inst_t> > failure_pending;
 
@@ -2158,6 +2210,8 @@ protected:
 
   void handle_pg_remove(OpRequestRef op);
   void _remove_pg(PG *pg);
+
+  void handle_shutdown_all_osd(MShutDownAllOsd *m);  //add by zhanghao
 
   // -- commands --
   struct Command {
@@ -2287,12 +2341,13 @@ protected:
   // -- removing --
   struct RemoveWQ :
     public ThreadPool::WorkQueueVal<pair<PGRef, DeletingStateRef> > {
+    CephContext *cct;
     ObjectStore *&store;
     list<pair<PGRef, DeletingStateRef> > remove_queue;
-    RemoveWQ(ObjectStore *&o, time_t ti, time_t si, ThreadPool *tp)
+    RemoveWQ(CephContext *_cct, ObjectStore *&o, time_t ti, time_t si, ThreadPool *tp)
       : ThreadPool::WorkQueueVal<pair<PGRef, DeletingStateRef> >(
 	"OSD::RemoveWQ", ti, si, tp),
-	store(o) {}
+	cct(_cct), store(o) {}
 
     bool _empty() {
       return remove_queue.empty();
@@ -2319,6 +2374,83 @@ protected:
     }
   } remove_wq;
 
+  // -- msg queue for shared messengers --
+  struct MsgWQ : public ThreadPool::WorkQueue<Message> {
+    OSD *osd;
+    list<Message *> msg_queue;
+    MsgWQ(OSD *_osd, time_t ti, time_t si, ThreadPool *tp) :
+      ThreadPool::WorkQueue<Message>("OSD::MsgWQ", ti, si, tp),
+      osd(_osd) {}
+
+    bool _enqueue(Message *m) {
+      msg_queue.push_back(m);
+      return true;
+    }
+    void _dequeue(Message *m) {
+      assert(0);
+    }
+    bool _empty() {
+      return msg_queue.empty();
+    }
+    Message *_dequeue() {
+      if (msg_queue.size()) {
+        Message *m = msg_queue.front();
+        msg_queue.pop_front();
+        return m;
+      }
+      return nullptr;
+    }
+    void _process(Message *m, ThreadPool::TPHandle &handle) override {
+      osd->_async_dispatch(m, handle);
+    }
+    void _clear() {
+      assert(msg_queue.empty());
+    }
+  } msg_wq;
+  void _async_dispatch(Message *m, ThreadPool::TPHandle &handle);
+
+  // -- heartbeat msg queue for shared messengers --
+  struct HbMsgWQ : public ThreadPool::WorkQueue<Message> {
+    OSD *osd;
+    list<Message *> msg_queue;
+    HbMsgWQ(OSD *_osd, time_t ti, time_t si, ThreadPool *tp) :
+      ThreadPool::WorkQueue<Message>("OSD::HbMsgWQ", ti, si, tp),
+      osd(_osd) {}
+
+    bool _enqueue(Message *m) {
+      msg_queue.push_back(m);
+      return true;
+    }
+    void _dequeue(Message *m) {
+      assert(0);
+    }
+    bool _empty() {
+      return msg_queue.empty();
+    }
+    Message *_dequeue() {
+      if (msg_queue.size()) {
+        Message *m = msg_queue.front();
+        msg_queue.pop_front();
+        return m;
+      }
+      return nullptr;
+    }
+    void _process(Message *m, ThreadPool::TPHandle &handle) override {
+      osd->_heartbeat_dispatch(m);
+    }
+    void _clear() {
+      assert(msg_queue.empty());
+    }
+    double get_max_age(utime_t now) {
+      Mutex::Locker l(get_lock());
+      if (msg_queue.empty())
+        return 0;
+      else
+        return (now - msg_queue.front()->get_recv_stamp());
+    }
+  } hb_msg_wq;
+  void _heartbeat_dispatch(Message *m);
+
  private:
   bool ms_can_fast_dispatch_any() const { return true; }
   bool ms_can_fast_dispatch(Message *m) const {
@@ -2341,6 +2473,24 @@ protected:
     case MSG_OSD_PG_UPDATE_LOG_MISSING:
     case MSG_OSD_PG_UPDATE_LOG_MISSING_REPLY:
       return true;
+    case CEPH_MSG_PING:
+    case CEPH_MSG_OSD_MAP:
+    case MSG_PGSTATSACK:
+    case MSG_MON_COMMAND:
+    case MSG_COMMAND:
+    case MSG_OSD_SCRUB:
+    case CEPH_MSG_SHUT_DOWN_ALL_OSD:
+    case MSG_OSD_PG_CREATE:
+    case MSG_OSD_PG_NOTIFY:
+    case MSG_OSD_PG_QUERY:
+    case MSG_OSD_PG_LOG:
+    case MSG_OSD_PG_REMOVE:
+    case MSG_OSD_PG_INFO:
+    case MSG_OSD_PG_TRIM:
+    case MSG_OSD_PG_MISSING:
+    case MSG_OSD_BACKFILL_RESERVE:
+    case MSG_OSD_RECOVERY_RESERVE:
+      return share_messengers;
     default:
       return false;
     }
@@ -2422,9 +2572,8 @@ private:
   template <typename T, int MSGTYPE>
   void handle_replica_op(OpRequestRef& op, OSDMapRef& osdmap);
 
-  int init_op_flags(OpRequestRef& op);
-
 public:
+  int init_op_flags(OpRequestRef& op);
   static int peek_meta(ObjectStore *store, string& magic,
 		       uuid_d& cluster_fsid, uuid_d& osd_fsid, int& whoami);
   
@@ -2433,6 +2582,9 @@ public:
   int pre_init();
   int init();
   void final_init();
+
+  int local_pre_init(ostream& err); // called by OSDInstance
+  int local_init(ostream& err); // called by OSDInstance
 
   int enable_disable_fuse(bool stop);
 

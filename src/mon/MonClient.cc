@@ -46,7 +46,7 @@
 
 #define dout_subsys ceph_subsys_monc
 #undef dout_prefix
-#define dout_prefix *_dout << "monclient" << (hunting ? "(hunting)":"") << ": "
+#define dout_prefix *_dout << "monclient" << (hunting ? "(hunting)":"") << ": state:"<<state << " "
 
 MonClient::MonClient(CephContext *cct_) :
   Dispatcher(cct_),
@@ -77,6 +77,36 @@ MonClient::MonClient(CephContext *cct_) :
 {
 }
 
+MonClient::MonClient(CephContext *cct_, int id) :
+  Dispatcher(cct_, id),
+  state(MC_STATE_NONE),
+  messenger(NULL),
+  cur_con(NULL),
+  rng(getpid()),
+  monc_lock("MonClient::monc_lock"),
+  timer(cct_, monc_lock), finisher(cct_),
+  authorize_handler_registry(NULL),
+  initialized(false),
+  no_keyring_disabled_cephx(false),
+  log_client(NULL),
+  more_log_pending(false),
+  auth_supported(NULL),
+  hunting(true),
+  want_monmap(true),
+  want_keys(0), global_id(0),
+  authenticate_err(0),
+  session_established_context(NULL),
+  had_a_connection(false),
+  reopen_interval_multiplier(1.0),
+  auth(NULL),
+  keyring(NULL),
+  rotating_secrets(NULL),
+  last_mon_command_tid(0),
+  version_req_id(0)
+{
+}
+
+
 MonClient::~MonClient()
 {
   delete auth_supported;
@@ -86,10 +116,10 @@ MonClient::~MonClient()
   delete rotating_secrets;
 }
 
-int MonClient::build_initial_monmap()
+int MonClient::build_initial_monmap(ostream* errout)
 {
   ldout(cct, 10) << "build_initial_monmap" << dendl;
-  return monmap.build_initial(cct, cerr);
+  return monmap.build_initial(cct, errout ? *errout : cerr);
 }
 
 int MonClient::get_monmap()
@@ -131,7 +161,16 @@ int MonClient::get_monmap_privately()
 
   while (monmap.fsid.is_zero()) {
     cur_mon = _pick_random_mon();
-    cur_con = messenger->get_connection(monmap.get_inst(cur_mon));
+    if(-1 == get_id())
+    {
+    	cur_con = messenger->get_connection(monmap.get_inst(cur_mon));
+    }
+    else
+    {
+    	entity_inst_t src_inst = messenger->get_myinst();
+  	    src_inst.name._num = get_id();
+	    cur_con = messenger->get_connection(src_inst, monmap.get_inst(cur_mon));
+    }
     if (cur_con) {
       ldout(cct, 10) << "querying mon." << cur_mon << " "
 		     << cur_con->get_peer_addr() << dendl;
@@ -146,13 +185,13 @@ int MonClient::get_monmap_privately()
     map_cond.WaitInterval(cct, monc_lock, interval);
 
     if (monmap.fsid.is_zero() && cur_con) {
-      cur_con->mark_down();  // nope, clean that connection up
+      conn_mark_down(cur_con);  // nope, clean that connection up
     }
   }
 
   if (temp_msgr) {
     if (cur_con) {
-      cur_con->mark_down();
+      conn_mark_down(cur_con);
       cur_con.reset(NULL);
       cur_mon.clear();
     }
@@ -229,8 +268,18 @@ int MonClient::ping_monitor(const string &mon_id, string *result_reply)
   Messenger *smsgr = Messenger::create_client_messenger(cct, "temp_ping_client");
   smsgr->add_dispatcher_head(pinger);
   smsgr->start();
-
-  ConnectionRef con = smsgr->get_connection(monmap.get_inst(new_mon_id));
+  
+  ConnectionRef con;
+  if(-1 == get_id())
+  {
+  	con = smsgr->get_connection(monmap.get_inst(new_mon_id));
+  }
+  else
+  {
+  	entity_inst_t src_inst = messenger->get_myinst();
+  	src_inst.name._num = get_id();
+	con = smsgr->get_connection(src_inst, monmap.get_inst(new_mon_id));
+  }
   ldout(cct, 10) << __func__ << " ping mon." << new_mon_id
                  << " " << con->get_peer_addr() << dendl;
   con->send_message(new MPing);
@@ -244,7 +293,7 @@ int MonClient::ping_monitor(const string &mon_id, string *result_reply)
   }
   pinger->lock.Unlock();
 
-  con->mark_down();
+  conn_mark_down(con);
   smsgr->shutdown();
   smsgr->wait();
   delete smsgr;
@@ -427,7 +476,7 @@ void MonClient::shutdown()
   }
 
   if (cur_con)
-    cur_con->mark_down();
+    cur_con->mark_down_impl();
   cur_con.reset(NULL);
   cur_mon.clear();
 
@@ -614,9 +663,18 @@ void MonClient::_reopen_session(int rank, string name)
   }
 
   if (cur_con) {
-    cur_con->mark_down();
+    conn_mark_down(cur_con);
   }
-  cur_con = messenger->get_connection(monmap.get_inst(cur_mon));
+  if(-1 == get_id())
+  {
+  	cur_con = messenger->get_connection(monmap.get_inst(cur_mon));
+  }
+  else
+  {
+  	entity_inst_t src_inst = messenger->get_myinst();
+  	src_inst.name._num = get_id();
+	cur_con = messenger->get_connection(src_inst, monmap.get_inst(cur_mon));
+  }
 	
   ldout(cct, 10) << "picked mon." << cur_mon << " con " << cur_con
 		 << " addr " << cur_con->get_peer_addr()
@@ -734,8 +792,9 @@ void MonClient::tick()
       if (cct->_conf->mon_client_ping_timeout > 0 &&
 	  cur_con->has_feature(CEPH_FEATURE_MSGR_KEEPALIVE2)) {
 	utime_t lk = cur_con->get_last_keepalive_ack();
+	now = ceph_clock_now(cct);
 	utime_t interval = now - lk;
-	if (interval > cct->_conf->mon_client_ping_timeout) {
+	if (now > lk && interval > cct->_conf->mon_client_ping_timeout) {
 	  ldout(cct, 1) << "no keepalive since " << lk << " (" << interval
 			<< " seconds), reconnecting" << dendl;
 	  _reopen_session();

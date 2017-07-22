@@ -37,6 +37,7 @@ public:
   static const int TYPE_MDS = CEPH_ENTITY_TYPE_MDS;
   static const int TYPE_OSD = CEPH_ENTITY_TYPE_OSD;
   static const int TYPE_CLIENT = CEPH_ENTITY_TYPE_CLIENT;
+  static const int TYPE_GBCM = CEPH_ENTITY_TYPE_GBCM;
 
   static const int64_t NEW = -1;
 
@@ -51,6 +52,7 @@ public:
   static entity_name_t MDS(int64_t i=NEW) { return entity_name_t(TYPE_MDS, i); }
   static entity_name_t OSD(int64_t i=NEW) { return entity_name_t(TYPE_OSD, i); }
   static entity_name_t CLIENT(int64_t i=NEW) { return entity_name_t(TYPE_CLIENT, i); }
+  static entity_name_t GBCM(int i=NEW) { return entity_name_t(TYPE_GBCM, i); }
   
   int64_t num() const { return _num; }
   int type() const { return _type; }
@@ -64,6 +66,7 @@ public:
   bool is_mds() const { return type() == TYPE_MDS; }
   bool is_osd() const { return type() == TYPE_OSD; }
   bool is_mon() const { return type() == TYPE_MON; }
+  bool is_gbcm() const { return type() == TYPE_GBCM; }
 
   operator ceph_entity_name() const {
     ceph_entity_name n = { _type, init_le64(_num) };
@@ -89,7 +92,10 @@ public:
     } else if (strstr(start, "client.") == start) {
       _type = TYPE_CLIENT;
       start += 7;
-    } else {
+    } else if (strstr(start, "gbcm.") == start) {
+	  _type = TYPE_GBCM;
+      start += 5;
+	} else {
       return false;
     }
     if (isspace(*start))
@@ -123,9 +129,11 @@ inline bool operator< (const entity_name_t& l, const entity_name_t& r) {
 
 inline std::ostream& operator<<(std::ostream& out, const entity_name_t& addr) {
   //if (addr.is_namer()) return out << "namer";
+#if 0
   if (addr.is_new() || addr.num() < 0)
     return out << addr.type_str() << ".?";
   else
+#endif
     return out << addr.type_str() << '.' << addr.num();
 }
 inline std::ostream& operator<<(std::ostream& out, const ceph_entity_name& addr) {
@@ -195,10 +203,24 @@ struct ceph_sockaddr_storage {
     *this = ss;
   }
 } __attribute__ ((__packed__));
-
 WRITE_CLASS_ENCODER(ceph_sockaddr_storage)
 
 struct entity_addr_t {
+  typedef enum {
+    TYPE_NONE = 0,
+    TYPE_LEGACY = 1,  ///< legacy msgr1 protocol (ceph jewel and older)
+    TYPE_MSGR2 = 2,   ///< msgr2 protocol (new in ceph kraken)
+  } type_t;
+  static const type_t TYPE_DEFAULT = TYPE_LEGACY;
+  static const char *get_type_name(int t) {
+    switch (t) {
+    case TYPE_NONE: return "none";
+    case TYPE_LEGACY: return "legacy";
+    case TYPE_MSGR2: return "msgr2";
+    default: return "???";
+    }
+  };
+
   __u32 type;
   __u32 nonce;
   union {
@@ -231,6 +253,9 @@ struct entity_addr_t {
 #endif
   }
 
+  uint32_t get_type() const { return type; }
+  void set_type(uint32_t t) { type = t; }
+
   __u32 get_nonce() const { return nonce; }
   void set_nonce(__u32 n) { nonce = n; }
 
@@ -251,6 +276,17 @@ struct entity_addr_t {
     return addr6;
   }
 
+  size_t get_sockaddr_len() const {
+    switch (addr.ss_family) {
+    case AF_INET:
+      return sizeof(addr4);
+      break;
+    case AF_INET6:
+      return sizeof(addr6);
+      break;
+    }
+    return sizeof(addr);
+  }
   bool set_sockaddr(struct sockaddr *sa)
   {
     switch (sa->sa_family) {
@@ -264,6 +300,13 @@ struct entity_addr_t {
       return false;
     }
     return true;
+  }
+
+  sockaddr_storage get_sockaddr_storage() const {
+    sockaddr_storage ss;
+    memcpy(&ss, &addr, sizeof(addr));
+    memset((char*)&ss + sizeof(addr), 0, sizeof(ss) - sizeof(addr));
+    return ss;
   }
 
   void set_in4_quad(int pos, int val) {

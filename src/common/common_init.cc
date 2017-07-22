@@ -66,8 +66,9 @@ CephContext *common_preinit(const CephInitParameters &iparams,
     // in these locations.  the mon already forces $mon_data/keyring.
     if (conf->name.is_mds())
       conf->set_val("keyring", "$mds_data/keyring", false);
-    else if (conf->name.is_osd())
+    else if (conf->name.is_osd()) {
       conf->set_val("keyring", "$osd_data/keyring", false);
+    }
     break;
 
   case CODE_ENVIRONMENT_UTILITY_NODOUT:
@@ -79,6 +80,11 @@ CephContext *common_preinit(const CephInitParameters &iparams,
 
   default:
     break;
+  }
+
+  if (!conf->name.is_client()) {
+    // close flog for mon/mds/osd/gbcm/auth ...
+    conf->set_val_or_die("flog_file", "");
   }
 
   if (flags & CINIT_FLAG_UNPRIVILEGED_DAEMON_DEFAULTS) {

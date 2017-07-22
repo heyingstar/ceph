@@ -24,7 +24,14 @@ libosd_a_SOURCES = \
 	osd/OpRequest.cc \
 	osd/SnapMapper.cc \
 	osd/ScrubStore.cc \
-	objclass/class_api.cc
+	objclass/class_api.cc \
+	osd/ErasureCodePG.cc \
+	osd/DirectECProcess.cc \
+	osd/NVRAMECProcess.cc \
+	osd/OSDMessengers.cc \
+	osd/OSDInstance.cc \
+	osd/OSDManager.cc \
+	osd/OSDPseudo.cc
 
 libosd_a_CXXFLAGS = ${AM_CXXFLAGS}
 libosd_a_LIBADD =
@@ -51,7 +58,14 @@ noinst_HEADERS += \
 	osd/ECTransaction.h \
 	osd/Watch.h \
 	osd/ScrubStore.h \
-	osd/osd_types.h
+	osd/osd_types.h \
+	osd/ErasureCodePG.h \
+	osd/DirectECProcess.h \
+	osd/NVRAMECProcess.h \
+	osd/OSDMessengers.h \
+	osd/OSDInstance.h \
+	osd/OSDManager.h \
+	osd/OSDPseudo.h
 
 endif # WITH_OSD
 endif # ENABLE_SERVER

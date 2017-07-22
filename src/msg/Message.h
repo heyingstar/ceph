@@ -1,4 +1,4 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 /*
  * Ceph - scalable distributed file system
@@ -7,14 +7,14 @@
  *
  * This is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
- * License version 2.1, as published by the Free Software 
+ * License version 2.1, as published by the Free Software
  * Foundation.  See file COPYING.
- * 
+ *
  */
 
 #ifndef CEPH_MESSAGE_H
 #define CEPH_MESSAGE_H
- 
+
 #include <stdlib.h>
 #include <ostream>
 
@@ -40,7 +40,7 @@
 #define MSG_MON_PAXOS              66
 #define MSG_MON_PROBE              67
 #define MSG_MON_JOIN               68
-#define MSG_MON_SYNC		   69
+#define MSG_MON_SYNC           69
 
 /* monitor <-> mon admin tool */
 #define MSG_MON_COMMAND            50
@@ -171,18 +171,27 @@
 #define MSG_TIMECHECK             0x600
 #define MSG_MON_HEALTH            0x601
 
+// by zhanghao for shut down all osd
+#define CEPH_MSG_SHUT_DOWN_ALL_OSD 0x801
+
 // *** Message::encode() crcflags bits ***
 #define MSG_CRC_DATA           (1 << 0)
 #define MSG_CRC_HEADER         (1 << 1)
 #define MSG_CRC_ALL            (MSG_CRC_DATA | MSG_CRC_HEADER)
 
 // Xio Testing
-#define MSG_DATA_PING		  0x602
+#define MSG_DATA_PING         0x602
 
 // Xio intends to define messages 0x603..0x606
 
 // Special
 #define MSG_NOP                   0x607
+
+/*add by lyb*/
+#define MSG_CONNECT  0X1FFF
+#define MSG_ACCEPT    0x1FFE
+#define MSG_VCON_NO_EXISTENT  0X1FFD
+#define MSG_REMOVE_VCON_ACK   0x1FFC
 
 // ======================================================
 
@@ -223,7 +232,7 @@ protected:
 
   ConnectionRef connection;
 
-  uint32_t magic;
+  uint32_t magic = 0;
 
   bi::list_member_hook<> dispatch_q;
 
@@ -243,42 +252,30 @@ public:
 				     &Message::dispatch_q > > Queue;
 
 protected:
-  CompletionHook* completion_hook; // owned by Messenger
+  CompletionHook* completion_hook = nullptr; // owned by Messenger
 
   // release our size in bytes back to this throttler when our payload
   // is adjusted or when we are destroyed.
-  Throttle *byte_throttler;
+  Throttle *byte_throttler = nullptr;
 
   // release a count back to this throttler when we are destroyed
-  Throttle *msg_throttler;
+  Throttle *msg_throttler = nullptr;
 
   // keep track of how big this message was when we reserved space in
   // the msgr dispatch_throttler, so that we can properly release it
   // later.  this is necessary because messages can enter the dispatch
   // queue locally (not via read_message()), and those are not
   // currently throttled.
-  uint64_t dispatch_throttle_size;
+  uint64_t dispatch_throttle_size = 0;
 
   friend class Messenger;
 
 public:
-  Message()
-    : connection(NULL),
-      magic(0),
-      completion_hook(NULL),
-      byte_throttler(NULL),
-      msg_throttler(NULL),
-      dispatch_throttle_size(0) {
+  Message() {
     memset(&header, 0, sizeof(header));
     memset(&footer, 0, sizeof(footer));
   }
-  Message(int t, int version=1, int compat_version=0)
-    : connection(NULL),
-      magic(0),
-      completion_hook(NULL),
-      byte_throttler(NULL),
-      msg_throttler(NULL),
-      dispatch_throttle_size(0) {
+  Message(int t, int version=1, int compat_version=0) {
     memset(&header, 0, sizeof(header));
     header.type = t;
     header.version = version;
@@ -327,6 +324,16 @@ public:
   uint32_t get_magic() const { return magic; }
   void set_magic(int _magic) { magic = _magic; }
 
+  struct ceph_entity_inst  get_header_src() const {return header.msg_src;}
+  struct ceph_entity_inst  get_header_dst() const {return header.msg_dst;}
+  void  set_header_src(struct ceph_entity_inst  a) { header.msg_src =a;}
+  void  set_header_dst(struct ceph_entity_inst  b) { header.msg_dst =b;}
+  uint64_t get_msg_seq() const {return header.msg_seq;}
+  uint64_t get_vcon_seq() const {return header.vcon_seq;}
+  void set_msg_seq(uint64_t a) {header.msg_seq = a;}
+  void set_vcon_seq(uint64_t b) {header.vcon_seq = b;}
+
+
   /*
    * If you use get_[data, middle, payload] you shouldn't
    * use it to change those bufferlists unless you KNOW
@@ -335,8 +342,9 @@ public:
    */
 
   void clear_payload() {
-    if (byte_throttler)
+    if (byte_throttler) {
       byte_throttler->put(payload.length() + middle.length());
+    }
     payload.clear();
     middle.clear();
   }
@@ -366,10 +374,10 @@ public:
 
   void set_middle(bufferlist& bl) {
     if (byte_throttler)
-      byte_throttler->put(payload.length());
+      byte_throttler->put(middle.length());
     middle.claim(bl, buffer::list::CLAIM_ALLOW_NONSHAREABLE);
     if (byte_throttler)
-      byte_throttler->take(payload.length());
+      byte_throttler->take(middle.length());
   }
   bufferlist& get_middle() { return middle; }
 
@@ -388,7 +396,7 @@ public:
       byte_throttler->put(data.length());
     bl.claim(data, flags);
   }
-  off_t get_data_len() { return data.length(); }
+  off_t get_data_len() const { return data.length(); }
 
   void set_recv_stamp(utime_t t) { recv_stamp = t; }
   const utime_t& get_recv_stamp() const { return recv_stamp; }
@@ -422,8 +430,8 @@ public:
   uint64_t get_tid() const { return header.tid; }
   void set_tid(uint64_t t) { header.tid = t; }
 
-  unsigned get_seq() const { return header.seq; }
-  void set_seq(unsigned s) { header.seq = s; }
+  uint64_t get_seq() const { return header.seq; }
+  void set_seq(uint64_t s) { header.seq = s; }
 
   unsigned get_priority() const { return header.priority; }
   void set_priority(__s16 p) { header.priority = p; }
@@ -467,9 +475,9 @@ public:
 typedef boost::intrusive_ptr<Message> MessageRef;
 
 extern Message *decode_message(CephContext *cct, int crcflags,
-			       ceph_msg_header &header,
-			       ceph_msg_footer& footer, bufferlist& front,
-			       bufferlist& middle, bufferlist& data);
+                   ceph_msg_header &header,
+                   ceph_msg_footer& footer, bufferlist& front,
+                   bufferlist& middle, bufferlist& data);
 inline ostream& operator<<(ostream& out, Message& m) {
   m.print(out);
   if (m.get_header().version)

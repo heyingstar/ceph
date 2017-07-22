@@ -1,4 +1,4 @@
-// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
 #ifdef ENCODE_DUMP
@@ -174,6 +174,21 @@ using namespace std;
 #include "messages/MOSDPGUpdateLogMissing.h"
 #include "messages/MOSDPGUpdateLogMissingReply.h"
 
+#include "messages/MShutDownAllOsd.h" // by bijingqiang
+
+#include "include/gbcm.h"
+#include "messages/MGBCMBlkGet.h"
+#include "messages/MGBCMBlkPut.h"
+#include "messages/MGBCMBlkUpdate.h"
+#include "messages/MGBCMHeartBeat.h"
+#include "messages/MGBCMQuotaBroadcast.h"
+#include "messages/MGBCMStatBroadcast.h"
+#include "messages/MVconnect.h"
+#include "messages/MVaccept.h"
+#include "messages/MVremove.h"
+#include "messages/MVremove_ack.h"
+
+
 #define DEBUGLVL  10    // debug level of output
 
 #define dout_subsys ceph_subsys_ms
@@ -182,7 +197,12 @@ void Message::encode(uint64_t features, int crcflags)
 {
   // encode and copy out of *m
   if (empty_payload()) {
+    assert(middle.length() == 0);
     encode_payload(features);
+
+    if (byte_throttler) {
+      byte_throttler->take(payload.length() + middle.length());
+    }
 
     // if the encoder didn't specify past compatibility, we assume it
     // is incompatible.
@@ -236,8 +256,8 @@ void Message::encode(uint64_t features, int crcflags)
 	       getpid(), i++);
       int fd = ::open(fn, O_WRONLY|O_TRUNC|O_CREAT, 0644);
       if (fd >= 0) {
-	bl.write_fd(fd);
-	::close(fd);
+        bl.write_fd(fd);
+        ::close(fd);
       }
     }
 #endif
@@ -254,10 +274,10 @@ void Message::dump(Formatter *f) const
 }
 
 Message *decode_message(CephContext *cct, int crcflags,
-			ceph_msg_header& header,
-			ceph_msg_footer& footer,
-			bufferlist& front, bufferlist& middle,
-			bufferlist& data)
+            ceph_msg_header& header,
+            ceph_msg_footer& footer,
+            bufferlist& front, bufferlist& middle,
+            bufferlist& data)
 {
   // verify crc
   if (crcflags & MSG_CRC_HEADER) {
@@ -266,19 +286,21 @@ Message *decode_message(CephContext *cct, int crcflags,
 
     if (front_crc != footer.front_crc) {
       if (cct) {
-	ldout(cct, 0) << "bad crc in front " << front_crc << " != exp " << footer.front_crc << dendl;
-	ldout(cct, 20) << " ";
-	front.hexdump(*_dout);
-	*_dout << dendl;
+    ldout(cct, 0) << __FUNCTION__ << ", msg type: " << header.type << ", bad crc in front "
+        << front_crc << " != exp " << footer.front_crc << dendl;
+    ldout(cct, 20) << " ";
+    front.hexdump(*_dout);
+    *_dout << dendl;
       }
       return 0;
     }
     if (middle_crc != footer.middle_crc) {
       if (cct) {
-	ldout(cct, 0) << "bad crc in middle " << middle_crc << " != exp " << footer.middle_crc << dendl;
-	ldout(cct, 20) << " ";
-	middle.hexdump(*_dout);
-	*_dout << dendl;
+    ldout(cct, 0) << __FUNCTION__ << ", msg type: " << header.type << ", bad crc in middle "
+        << middle_crc << " != exp " << footer.middle_crc << dendl;
+    ldout(cct, 20) << " ";
+    middle.hexdump(*_dout);
+    *_dout << dendl;
       }
       return 0;
     }
@@ -287,13 +309,14 @@ Message *decode_message(CephContext *cct, int crcflags,
     if ((footer.flags & CEPH_MSG_FOOTER_NOCRC) == 0) {
       __u32 data_crc = data.crc32c(0);
       if (data_crc != footer.data_crc) {
-	if (cct) {
-	  ldout(cct, 0) << "bad crc in data " << data_crc << " != exp " << footer.data_crc << dendl;
-	  ldout(cct, 20) << " ";
-	  data.hexdump(*_dout);
-	  *_dout << dendl;
-	}
-	return 0;
+    if (cct) {
+      ldout(cct, 0) << __FUNCTION__ << ", msg type: " << header.type << ", bad crc in data "
+        << data_crc << " != exp " << footer.data_crc << dendl;
+      ldout(cct, 20) << " ";
+      data.hexdump(*_dout);
+      *_dout << dendl;
+    }
+    return 0;
       }
     }
   }
@@ -385,7 +408,7 @@ Message *decode_message(CephContext *cct, int crcflags,
   case MSG_FORWARD:
     m = new MForward;
     break;
-    
+
   case CEPH_MSG_MON_MAP:
     m = new MMonMap;
     break;
@@ -527,7 +550,7 @@ Message *decode_message(CephContext *cct, int crcflags,
 
   case MSG_MON_GLOBAL_ID:
     m = new MMonGlobalID;
-    break; 
+    break;
 
     // clients
   case CEPH_MSG_MON_SUBSCRIBE:
@@ -566,6 +589,22 @@ Message *decode_message(CephContext *cct, int crcflags,
   case CEPH_MSG_CLIENT_QUOTA:
     m = new MClientQuota;
     break;
+  case CEPH_MSG_CLIENT_USER_QUOTA:
+    m = new MClientUserQuota;
+    break;
+  case CEPH_MSG_CLIENT_USER_FILE_QUOTA:
+    m = new MClientUserFileQuota;
+    break;
+  case CEPH_MSG_CLIENT_GRP_QUOTA:
+    m = new MClientGrpQuota;
+    break;
+  case CEPH_MSG_CLIENT_GRP_FILE_QUOTA:
+    m = new MClientGrpFileQuota;
+    break;
+  //dir quota
+  case CEPH_MSG_CLIENT_DIR_QUOTA:
+    m = new MClientDirQuota;
+    break;
 
     // mds
   case MSG_MDS_SLAVE_REQUEST:
@@ -592,12 +631,12 @@ Message *decode_message(CephContext *cct, int crcflags,
     break;
   case MSG_MDS_CACHEREJOIN:
     m = new MMDSCacheRejoin;
-	break;
-	/*
+    break;
+    /*
   case MSG_MDS_CACHEREJOINACK:
-	m = new MMDSCacheRejoinAck;
-	break;
-	*/
+    m = new MMDSCacheRejoinAck;
+    break;
+    */
 
   case MSG_MDS_DIRUPDATE:
     m = new MDirUpdate();
@@ -694,10 +733,10 @@ Message *decode_message(CephContext *cct, int crcflags,
     m = new MMDSTableRequest;
     break;
 
-	/*  case MSG_MDS_INODEUPDATE:
+    /*  case MSG_MDS_INODEUPDATE:
     m = new MInodeUpdate();
     break;
-	*/
+    */
 
   case MSG_MDS_INODEFILECAPS:
     m = new MInodeFileCaps();
@@ -714,22 +753,57 @@ Message *decode_message(CephContext *cct, int crcflags,
   case MSG_MON_HEALTH:
     m = new MMonHealth();
     break;
-#if defined(HAVE_XIO)
+
+   //add by zhanghao
+  case CEPH_MSG_SHUT_DOWN_ALL_OSD:
+    m = new MShutDownAllOsd();
+    break;
+
+//#if defined(HAVE_XIO)
   case MSG_DATA_PING:
     m = new MDataPing();
     break;
-#endif
+//#endif
     // -- simple messages without payload --
 
   case CEPH_MSG_SHUTDOWN:
     m = new MGenericMessage(type);
     break;
-
+  case CEPH_CLIENT_MSG_BLK_GET:
+    m = new MGBCMBlkGet();
+    break;
+  case CEPH_CLIENT_MSG_BLK_UPDATE:
+    m = new MGBCMBlkUpdate();
+    break;
+  case CEPH_CLIENT_MSG_BLK_PUT:
+    m = new MGBCMBlkPut();
+    break;
+  case CEPH_CLIENT_MSG_QUOTA_BROADCAST:
+    m = new MGBCMQuotaBroadcast();
+    break;
+  case CEPH_CLIENT_MSG_STAT_BROADCAST:
+    m = new MGBCMStatBroadcast();
+    break;
+  case CEPH_CLIENT_MSG_HEARTBEAT:
+    m = new MGBCMHeartBeat();
+    break;
+  case MSG_ACCEPT:
+    m = new vaccept(type);
+    break;
+  case MSG_VCON_NO_EXISTENT:
+    m = new vremove(type);
+    break;
+  case MSG_CONNECT:
+    m = new vconnect(type);
+    break;
+  case MSG_REMOVE_VCON_ACK:
+    m = new vremove_ack(type);
+    break;
   default:
     if (cct) {
       ldout(cct, 0) << "can't decode unknown message type " << type << " MSG_AUTH=" << CEPH_MSG_AUTH << dendl;
       if (cct->_conf->ms_die_on_bad_msg)
-	assert(0);
+	ceph_abort();
     }
     return 0;
   }
@@ -742,12 +816,12 @@ Message *decode_message(CephContext *cct, int crcflags,
   if (m->get_header().version &&
       m->get_header().version < header.compat_version) {
     if (cct) {
-      ldout(cct, 0) << "will not decode message of type " << type
-		    << " version " << header.version
-		    << " because compat_version " << header.compat_version
-		    << " > supported version " << m->get_header().version << dendl;
+      ldout(cct, 0) << __FUNCTION__ << ", con: " << m->get_connection() << ", will not decode message of type " << type
+            << " version " << header.version
+            << " because compat_version " << header.compat_version
+            << " > supported version " << m->get_header().version << dendl;
       if (cct->_conf->ms_die_on_bad_msg)
-	assert(0);
+    assert(0);
     }
     m->put();
     return 0;
@@ -764,14 +838,14 @@ Message *decode_message(CephContext *cct, int crcflags,
   }
   catch (const buffer::error &e) {
     if (cct) {
-      lderr(cct) << "failed to decode message of type " << type
-		 << " v" << header.version
-		 << ": " << e.what() << dendl;
+      lderr(cct) << __FUNCTION__ << ", con: " << m->get_connection() << ", failed to decode message of type " << type
+         << " v" << header.version
+         << ": " << e.what() << dendl;
       ldout(cct, cct->_conf->ms_dump_corrupt_message_level) << "dump: \n";
       m->get_payload().hexdump(*_dout);
       *_dout << dendl;
       if (cct->_conf->ms_die_on_bad_msg)
-	assert(0);
+	ceph_abort();
     }
     m->put();
     return 0;
@@ -799,10 +873,10 @@ void encode_message(Message *msg, uint64_t features, bufferlist& payload)
   // Here's where we switch to the old footer format.  PLR
 
   footer = msg->get_footer();
-  old_footer.front_crc = footer.front_crc;   
-  old_footer.middle_crc = footer.middle_crc;   
-  old_footer.data_crc = footer.data_crc;   
-  old_footer.flags = footer.flags;   
+  old_footer.front_crc = footer.front_crc;
+  old_footer.middle_crc = footer.middle_crc;
+  old_footer.data_crc = footer.data_crc;
+  old_footer.flags = footer.flags;
   ::encode(old_footer, payload);
 
   ::encode(msg->get_payload(), payload);

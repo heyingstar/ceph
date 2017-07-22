@@ -29,6 +29,7 @@
 #include "common/Formatter.h"
 #include "common/Graylog.h"
 #include "log/Log.h"
+#include "log/FLog.h"
 #include "auth/Crypto.h"
 #include "include/str_list.h"
 #include "common/Mutex.h"
@@ -78,6 +79,43 @@ private:
 
 } // anonymous namespace
 
+void AsyncRdmaConns::dec_conns(bool is_server)
+{ 
+  if(is_server) {
+    if(s_conns.read()==0) {
+      lderr(m_cct) << "WARNING: s_conns is zero, And attempt to dec it." << dendl;
+      return;
+    }
+    s_conns.dec();
+  } else {
+    if(c_conns.read()==0) {
+      lderr(m_cct) << "WARNING: c_conns is zero, And attempt to dec it." << dendl;
+      return;
+    }
+    c_conns.dec();
+  }
+}
+void AsyncRdmaConns::inc_conns(bool is_server)
+{ 
+  if(is_server)
+    s_conns.inc();
+  else
+    c_conns.inc();
+}
+
+bool FailureHandler::inject_failure()
+{
+  if (failed_at.read()) {
+    uint32_t final = failed_at.dec();
+    if (final == 0) {
+      report_failure(0, "inject_failure");
+      return true;
+    }
+  }
+
+  return false;
+}
+
 class CephContextServiceThread : public Thread
 {
 public:
@@ -106,6 +144,7 @@ public:
 
       if (_reopen_logs) {
         _cct->_log->reopen_log_file();
+        _cct->_flog->reopen_log_file();
         _reopen_logs = false;
       }
       _cct->_heartbeat_map->check_touch_file();
@@ -228,6 +267,77 @@ public:
   }
 };
 
+class FLogObs : public md_config_obs_t {
+  ceph::log::FLog *log;
+
+public:
+  explicit FLogObs(ceph::log::FLog *l) : log(l) {}
+
+  const char** get_tracked_conf_keys() const {
+    static const char *KEYS[] = {
+      "flog_file",
+      NULL
+    };
+    return KEYS;
+  }
+
+  void handle_conf_change(const md_config_t *conf,
+                          const std::set <std::string> &changed) {
+    // stderr
+    if (changed.count("log_to_stderr") || changed.count("err_to_stderr")) {
+      int l = conf->log_to_stderr ? 99 : (conf->err_to_stderr ? -1 : -2);
+      log->set_stderr_level(l, l);
+    }
+
+    // syslog
+    if (changed.count("log_to_syslog")) {
+      int l = conf->log_to_syslog ? 99 : (conf->err_to_syslog ? -1 : -2);
+      log->set_syslog_level(l, l);
+    }
+
+    // file
+    if (changed.count("flog_file")) {
+      log->set_log_file(conf->flog_file);
+      log->reopen_log_file();
+    }
+
+    if (changed.count("log_max_new")) {
+
+      log->set_max_new(conf->log_max_new);
+    }
+
+    if (changed.count("log_max_recent")) {
+      log->set_max_recent(conf->log_max_recent);
+    }
+
+    // graylog
+    if (changed.count("log_to_graylog") || changed.count("err_to_graylog")) {
+      int l = conf->log_to_graylog ? 99 : (conf->err_to_graylog ? -1 : -2);
+      log->set_graylog_level(l, l);
+
+      if (conf->log_to_graylog || conf->err_to_graylog) {
+	log->start_graylog();
+      } else if (! (conf->log_to_graylog && conf->err_to_graylog)) {
+	log->stop_graylog();
+      }
+    }
+
+    if (log->graylog() && (changed.count("log_graylog_host") || changed.count("log_graylog_port"))) {
+      log->graylog()->set_destination(conf->log_graylog_host, conf->log_graylog_port);
+    }
+
+    // metadata
+    if (log->graylog() && changed.count("host")) {
+      log->graylog()->set_hostname(conf->host);
+    }
+
+    if (log->graylog() && changed.count("fsid")) {
+      log->graylog()->set_fsid(conf->fsid);
+    }
+  }
+};
+
+
 
 // cct config watcher
 class CephContextObs : public md_config_obs_t {
@@ -339,6 +449,9 @@ void CephContext::do_command(std::string command, cmdmap_t& cmdmap,
         f->dump_stream("error") << "Not find: " << var;
     }
   }
+  else if (command == "rdma conns") {
+    _AsyncRdmaConns->dump_formatted(f);
+  }
   else {
     string section = command;
     boost::replace_all(section, " ", "_");
@@ -356,6 +469,20 @@ void CephContext::do_command(std::string command, cmdmap_t& cmdmap,
       } else {
 	// val may be multiple words
 	string valstr = str_join(val, " ");
+        if(var == "client_acl_type") {
+            if(valstr == " " || valstr == "posix_acl" || valstr == "posix_extend_acl" || valstr == "posix_quick_acl") {
+                int r = _conf->set_val(var.c_str(), valstr.c_str());
+                if (r < 0) {
+                    f->dump_stream("error") << "error setting '" << var << "' to '" << valstr << "': " << cpp_strerror(r);
+                } else {
+                    ostringstream ss;
+                    _conf->apply_changes(&ss);
+                    f->dump_string("success", ss.str());
+                }
+            }else{
+                f->dump_stream("error") << "error setting '" << var.c_str() << "' to '" << valstr.c_str();
+            }
+        } else{
         int r = _conf->set_val(var.c_str(), valstr.c_str());
         if (r < 0) {
           f->dump_stream("error") << "error setting '" << var << "' to '" << valstr << "': " << cpp_strerror(r);
@@ -365,6 +492,7 @@ void CephContext::do_command(std::string command, cmdmap_t& cmdmap,
           f->dump_string("success", ss.str());
         }
       }
+     }
     } else if (command == "config get") {
       std::string var;
       if (!cmd_getval(this, cmdmap, "var", var)) {
@@ -414,12 +542,15 @@ void CephContext::do_command(std::string command, cmdmap_t& cmdmap,
       f->close_section(); // unknown
     } else if (command == "log flush") {
       _log->flush();
+      _flog->flush();
     }
     else if (command == "log dump") {
       _log->dump_recent();
+      _flog->dump_recent();
     }
     else if (command == "log reopen") {
       _log->reopen_log_file();
+      _flog->reopen_log_file();
     }
     else {
       assert(0 == "registered under wrong command?");    
@@ -437,6 +568,8 @@ CephContext::CephContext(uint32_t module_type_, int init_flags_)
   : nref(1),
     _conf(new md_config_t()),
     _log(NULL),
+    _flog(NULL),
+    _stop(false),
     _module_type(module_type_),
     _init_flags(init_flags_),
     _set_uid(0),
@@ -446,6 +579,7 @@ CephContext::CephContext(uint32_t module_type_, int init_flags_)
     _crypto_inited(false),
     _service_thread(NULL),
     _log_obs(NULL),
+    _flog_obs(NULL),
     _admin_socket(NULL),
     _perf_counters_collection(NULL),
     _perf_counters_conf_obs(NULL),
@@ -454,18 +588,30 @@ CephContext::CephContext(uint32_t module_type_, int init_flags_)
     _crypto_aes(NULL),
     _plugin_registry(NULL),
     _lockdep_obs(NULL),
-    _cct_perf(NULL)
+    _cct_perf(NULL),
+    _failure_handler(NULL)
 {
   ceph_spin_init(&_service_thread_lock);
   ceph_spin_init(&_associated_objs_lock);
+  ceph_spin_init(&_fork_watchers_lock);
   ceph_spin_init(&_feature_lock);
   ceph_spin_init(&_cct_perf_lock);
 
   _log = new ceph::log::Log(&_conf->subsys);
   _log->start();
+  _flog = new ceph::log::FLog(&_conf->subsys);
+  _flog->start();
+  
+  pthread_mutex_init(&g_lock_dump, NULL);
+  pthread_mutex_init(&g_lock_dump_finish, NULL);
+  pthread_cond_init(&g_dump_cond,NULL);
+  pthread_cond_init(&g_dump_finish_cond,NULL);
 
   _log_obs = new LogObs(_log);
   _conf->add_observer(_log_obs);
+
+  _flog_obs = new FLogObs(_flog);
+  _conf->add_observer(_flog_obs);
 
   _cct_obs = new CephContextObs(this);
   _conf->add_observer(_cct_obs);
@@ -475,6 +621,8 @@ CephContext::CephContext(uint32_t module_type_, int init_flags_)
 
   _perf_counters_collection = new PerfCountersCollection(this);
  
+  _AsyncRdmaConns = new AsyncRdmaConns(this);
+
   _admin_socket = new AdminSocket(this);
   _heartbeat_map = new HeartbeatMap(this);
 
@@ -497,6 +645,7 @@ CephContext::CephContext(uint32_t module_type_, int init_flags_)
   _admin_socket->register_command("log flush", "log flush", _admin_hook, "flush log entries to log file");
   _admin_socket->register_command("log dump", "log dump", _admin_hook, "dump recent log entries to log file");
   _admin_socket->register_command("log reopen", "log reopen", _admin_hook, "reopen log file");
+  _admin_socket->register_command("rdma conns", "rdma conns", _admin_hook, "rdma connections");
 
   _crypto_none = CryptoHandler::create(CEPH_CRYPTO_NONE);
   _crypto_aes = CryptoHandler::create(CEPH_CRYPTO_AES);
@@ -532,6 +681,7 @@ CephContext::~CephContext()
   _admin_socket->unregister_command("log flush");
   _admin_socket->unregister_command("log dump");
   _admin_socket->unregister_command("log reopen");
+  _admin_socket->unregister_command("rdma conns");
   delete _admin_hook;
   delete _admin_socket;
 
@@ -547,6 +697,10 @@ CephContext::~CephContext()
   delete _log_obs;
   _log_obs = NULL;
 
+  _conf->remove_observer(_flog_obs);
+  delete _flog_obs;
+  _flog_obs = NULL;
+
   _conf->remove_observer(_cct_obs);
   delete _cct_obs;
   _cct_obs = NULL;
@@ -559,8 +713,13 @@ CephContext::~CephContext()
   delete _log;
   _log = NULL;
 
+  _flog->stop();
+  delete _flog;
+  _flog = NULL;
+
   delete _conf;
   ceph_spin_destroy(&_service_thread_lock);
+  ceph_spin_destroy(&_fork_watchers_lock);
   ceph_spin_destroy(&_associated_objs_lock);
   ceph_spin_destroy(&_feature_lock);
   ceph_spin_destroy(&_cct_perf_lock);
@@ -599,8 +758,10 @@ void CephContext::start_service_thread()
   ceph_spin_unlock(&_service_thread_lock);
 
   // make logs flush on_exit()
-  if (_conf->log_flush_on_exit)
+  if (_conf->log_flush_on_exit) {
     _log->set_flush_on_exit();
+    _flog->set_flush_on_exit();
+  }
 
   // Trigger callbacks on any config observers that were waiting for
   // it to become safe to start threads.
@@ -656,6 +817,11 @@ PerfCountersCollection *CephContext::get_perfcounters_collection()
   return _perf_counters_collection;
 }
 
+AsyncRdmaConns *CephContext::get_AsyncRdmaConns()
+{
+  return _AsyncRdmaConns;
+}
+
 void CephContext::enable_perf_counter()
 {
   PerfCountersBuilder plb(this, "cct", l_cct_first, l_cct_last);
@@ -706,4 +872,19 @@ CryptoHandler *CephContext::get_crypto_handler(int type)
   default:
     return NULL;
   }
+}
+
+bool CephContext::report_assertion_failure(const char *assertion, 
+  const char *file, int line, const char *function) const
+{
+  if (!_failure_handler)
+    return false;
+  if (_failure_handler->is_failed())
+    return true;
+
+  ostringstream oss;
+  oss << file << ": " << line << ": FAILED assert(" << assertion << ") in " << function;
+  std::string desc = oss.str();
+  _failure_handler->report_failure(0, desc.c_str());
+  return true;
 }

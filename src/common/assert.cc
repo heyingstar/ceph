@@ -71,7 +71,7 @@ namespace ceph {
       bt->print(*_dout);
       *_dout << " NOTE: a copy of the executable, or `objdump -rdS <executable>` "
 	     << "is needed to interpret this.\n" << dendl;
-
+      g_assert_context->send_fatal_cond(); 
       g_assert_context->_log->dump_recent();
     }
 
@@ -141,7 +141,7 @@ namespace ceph {
       bt->print(*_dout);
       *_dout << " NOTE: a copy of the executable, or `objdump -rdS <executable>` "
 	     << "is needed to interpret this.\n" << dendl;
-
+      g_assert_context->send_fatal_cond();
       g_assert_context->_log->dump_recent();
     }
 
