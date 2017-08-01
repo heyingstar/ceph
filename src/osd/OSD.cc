@@ -74,8 +74,6 @@
 #include "messages/MOSDBoot.h"
 #include "messages/MOSDPGTemp.h"
 
-
-
 #include "messages/MOSDMap.h"
 #include "messages/MMonGetOSDMap.h"
 #include "messages/MOSDPGNotify.h"
